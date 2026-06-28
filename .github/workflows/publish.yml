@@ -1,0 +1,93 @@
+# Publish the Tegis SDK packages to npm, with build provenance.
+#
+# Manual trigger (Actions → "publish" → Run workflow). Builds with a pinned bun, verifies the bundle is
+# real (not a stub), attests the tarball, then publishes it.
+#
+# This repo is PUBLIC, so GitHub build provenance works on the free plan. We attest the exact tarball via
+# actions/attest-build-provenance (verify with `gh attestation verify <tarball> --repo tegisio/tegis-js`).
+# Attestation runs BEFORE publish, so a provenance failure skips publish (no version burned).
+#
+# Requires repo secret NPM_TOKEN — a granular npm automation token with publish access to the @tegis org.
+# Bump each package's version before re-running (npm rejects republishing an existing version).
+name: publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      package:
+        description: Which package(s) to publish
+        type: choice
+        options:
+          - both
+          - server
+          - player
+        default: both
+
+permissions:
+  contents: read
+  id-token: write
+  attestations: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        pkg: [server, player]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.5" # pinned: newer bun changed bun build and shipped non-bundled stubs
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Install workspace
+        run: bun install --frozen-lockfile
+
+      - name: Gate — golden-vector parity (server only)
+        if: ${{ success() && matrix.pkg == 'server' && (inputs.package == 'both' || inputs.package == 'server') }}
+        working-directory: packages/server
+        run: bun test
+
+      - name: Build @tegis/${{ matrix.pkg }}
+        if: ${{ success() && (inputs.package == 'both' || inputs.package == matrix.pkg) }}
+        working-directory: packages/${{ matrix.pkg }}
+        run: bun run build
+
+      - name: Verify bundle is real (server)
+        if: ${{ success() && matrix.pkg == 'server' && (inputs.package == 'both' || inputs.package == 'server') }}
+        working-directory: packages/server
+        run: |
+          bun -e 'import { TegisServer } from "./dist/index.js"; if (typeof TegisServer !== "function") throw new Error("broken bundle - TegisServer missing"); console.log("bundle ok");'
+
+      - name: Verify bundle is real (player)
+        if: ${{ success() && matrix.pkg == 'player' && (inputs.package == 'both' || inputs.package == 'player') }}
+        working-directory: packages/player
+        run: |
+          bun -e 'import { TegisPlayer, loadWasmHandshake } from "./dist/index.js"; if (typeof TegisPlayer !== "function" || typeof loadWasmHandshake !== "function") throw new Error("broken bundle - exports missing"); console.log("bundle ok");'
+
+      - name: Pack @tegis/${{ matrix.pkg }}
+        id: pack
+        if: ${{ success() && (inputs.package == 'both' || inputs.package == matrix.pkg) }}
+        working-directory: packages/${{ matrix.pkg }}
+        run: echo "tarball=$(npm pack --ignore-scripts 2>/dev/null | tail -1)" >> "$GITHUB_OUTPUT"
+
+      - name: Attest build provenance (SLSA)
+        if: ${{ success() && (inputs.package == 'both' || inputs.package == matrix.pkg) }}
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: packages/${{ matrix.pkg }}/${{ steps.pack.outputs.tarball }}
+
+      - name: Publish @tegis/${{ matrix.pkg }}
+        if: ${{ success() && (inputs.package == 'both' || inputs.package == matrix.pkg) }}
+        working-directory: packages/${{ matrix.pkg }}
+        run: npm publish "${{ steps.pack.outputs.tarball }}" --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

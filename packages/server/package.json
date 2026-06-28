@@ -1,0 +1,55 @@
+{
+  "name": "@tegis/server",
+  "version": "0.1.2",
+  "description": "Tegis backend SDK — mint short-lived, EdDSA-signed entitlement grants. The tenant signing key never leaves your server.",
+  "type": "module",
+  "license": "MIT",
+  "author": "okbrk <burak@okbrk.com>",
+  "homepage": "https://tegis.io",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tegisio/tegis-js.git",
+    "directory": "packages/server"
+  },
+  "keywords": [
+    "tegis",
+    "content-protection",
+    "anti-piracy",
+    "entitlement",
+    "drm",
+    "video",
+    "jws",
+    "eddsa",
+    "ed25519"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "sideEffects": false,
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "clean": "rm -rf dist",
+    "build": "bun run clean && bun build ./src/index.ts --target=node --format=esm --outdir dist && tsc -p tsconfig.build.json && bun ../../scripts/fix-dts.ts dist",
+    "prepublishOnly": "bun run build"
+  }
+}

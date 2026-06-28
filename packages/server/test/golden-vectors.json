@@ -1,0 +1,74 @@
+{
+  "$note": "Committed Ed25519 canon fixture, validated by reference/dataplane-go (go test ./canon). Regenerate via a Go tool if canonicalization changes.",
+  "algorithm": "Ed25519",
+  "canonical": "join(['tid','ast','ses','path','ipBucket',str(exp)], '\\n') as UTF-8; signature = base64url(no-pad) of 64-byte EdDSA",
+  "ipBucket": "IPv4 → A.B.C.0/24 ; IPv6 → first 48 bits as fixed 4-hex groups xxxx:xxxx:xxxx::/48",
+  "keys": {
+    "kid_demoA": {
+      "seedHex": "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+      "publicKeyB64u": "PM0kHP_Js2GARLl9A22GFFk9iwF8NA8d7odzOFUXZUs"
+    },
+    "kid_demoB": {
+      "seedHex": "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",
+      "publicKeyB64u": "Vo-lUxx9dNJxQNGulk_zwLGfVW_COoebJRSV_BunhjE"
+    }
+  },
+  "vectors": [
+    {
+      "name": "basic-1080p-A",
+      "kid": "kid_demoA",
+      "claims": {
+        "tid": "ten_DEMO",
+        "ast": "ast_DEMO1",
+        "ses": "ses_AAA",
+        "path": "/seg/v1/ast_DEMO1/h264/1080p/A/00001.m4s",
+        "ipBucket": "203.0.113.0/24",
+        "exp": 1781049600
+      },
+      "canonical": "ten_DEMO\nast_DEMO1\nses_AAA\n/seg/v1/ast_DEMO1/h264/1080p/A/00001.m4s\n203.0.113.0/24\n1781049600",
+      "sigB64u": "V_Hxur8v1XavZ0lm5Ea5HvAVMmHOuJ9vyHRHT8lwGsCMl4PefBdoyiyDUcEAm4--8F2gApucT5-zySpmRsNYCA"
+    },
+    {
+      "name": "variant-B-2160p",
+      "kid": "kid_demoA",
+      "claims": {
+        "tid": "ten_DEMO",
+        "ast": "ast_DEMO1",
+        "ses": "ses_AAA",
+        "path": "/seg/v1/ast_DEMO1/hevc/2160p/B/00042.m4s",
+        "ipBucket": "203.0.113.0/24",
+        "exp": 1781049630
+      },
+      "canonical": "ten_DEMO\nast_DEMO1\nses_AAA\n/seg/v1/ast_DEMO1/hevc/2160p/B/00042.m4s\n203.0.113.0/24\n1781049630",
+      "sigB64u": "te3BqrAqDHHteN26Fa_rETLDeJz2TKNWx6vj8EIhJ_nuQ6-PCc4EbWQebbPaXjdmSfl3nDPXAR-PHZI8rF8OCQ"
+    },
+    {
+      "name": "other-tenant-key",
+      "kid": "kid_demoB",
+      "claims": {
+        "tid": "ten_OTHER",
+        "ast": "ast_X",
+        "ses": "ses_ZZZ",
+        "path": "/seg/v1/ast_X/h264/720p/A/00007.m4s",
+        "ipBucket": "198.51.100.0/24",
+        "exp": 1781050000
+      },
+      "canonical": "ten_OTHER\nast_X\nses_ZZZ\n/seg/v1/ast_X/h264/720p/A/00007.m4s\n198.51.100.0/24\n1781050000",
+      "sigB64u": "owuxVAPaE5mAB8dgLMFyGCFG_eOQQhwzxEBL8rHXSL8Cz-d32-yMpuOtdsCVAalpXwvIlaJMFkWNhDviFnShAg"
+    },
+    {
+      "name": "ipv6-bucket",
+      "kid": "kid_demoB",
+      "claims": {
+        "tid": "ten_DEMO",
+        "ast": "ast_V6",
+        "ses": "ses_V6",
+        "path": "/seg/v1/ast_V6/h264/1080p/A/00100.m4s",
+        "ipBucket": "2001:0db8:1234::/48",
+        "exp": 1781050100
+      },
+      "canonical": "ten_DEMO\nast_V6\nses_V6\n/seg/v1/ast_V6/h264/1080p/A/00100.m4s\n2001:0db8:1234::/48\n1781050100",
+      "sigB64u": "v44GImSDXXERANMMPyiX7XfAkMMGP63L9XpTJKsO0GJyD5nh2ebJ1JJue-ir0bPzaxpSm47OT3VTkFHY_rCvBA"
+    }
+  ]
+}

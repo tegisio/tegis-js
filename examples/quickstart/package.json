@@ -1,0 +1,16 @@
+{
+  "name": "tegis-quickstart",
+  "private": true,
+  "type": "module",
+  "description": "30-minute Tegis quickstart — consumes the published @tegis/server + @tegis/player packages only.",
+  "scripts": {
+    "build:web": "bun build public/app.ts --target=browser --outfile public/app.js",
+    "server": "bun run server.ts",
+    "start": "bun run build:web && bun run server",
+    "link-local": "bun run link-local-stack.ts"
+  },
+  "dependencies": {
+    "@tegis/server": "^0.1.0",
+    "@tegis/player": "^0.1.0"
+  }
+}

@@ -1,0 +1,4 @@
+node_modules/
+.env
+public/app.js
+bun.lock

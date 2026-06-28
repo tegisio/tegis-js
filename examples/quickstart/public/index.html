@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Tegis quickstart</title>
+    <style>
+      body { font: 15px/1.5 system-ui, sans-serif; max-width: 720px; margin: 3rem auto; padding: 0 1rem; }
+      video { width: 100%; background: #000; border-radius: 8px; aspect-ratio: 16 / 9; }
+      button { font: inherit; padding: 0.5rem 1rem; border-radius: 6px; cursor: pointer; margin: 1rem 0; }
+      pre { background: #f5f5f5; padding: 0.75rem; border-radius: 6px; min-height: 4rem; white-space: pre-wrap; }
+    </style>
+  </head>
+  <body>
+    <h1>Tegis quickstart</h1>
+    <p>Protected playback via <code>@tegis/player</code>. Requires real Chrome (H.264 + MSE).</p>
+    <video id="video" controls playsinline></video>
+    <button id="play">Play protected asset</button>
+    <pre id="status"></pre>
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

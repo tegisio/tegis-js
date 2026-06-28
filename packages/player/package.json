@@ -1,0 +1,63 @@
+{
+  "name": "@tegis/player",
+  "version": "0.1.2",
+  "description": "Tegis browser player SDK — attest → WASM handshake → mint → renew, with WebCrypto AES-CTR segment playback. Never holds a tenant key.",
+  "type": "module",
+  "license": "MIT",
+  "author": "okbrk <burak@okbrk.com>",
+  "homepage": "https://tegis.io",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tegisio/tegis-js.git",
+    "directory": "packages/player"
+  },
+  "keywords": [
+    "tegis",
+    "content-protection",
+    "anti-piracy",
+    "player",
+    "video",
+    "drm",
+    "mse",
+    "webcrypto",
+    "wasm",
+    "hls"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "browser": "./dist/index.js",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./bundle": {
+      "types": "./dist/bundle-entry.d.ts",
+      "default": "./dist/bundle-entry.js"
+    },
+    "./wasm/hmac-sha256.wasm": "./wasm/hmac-sha256.wasm",
+    "./package.json": "./package.json"
+  },
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "browser": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "wasm/hmac-sha256.wasm",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "sideEffects": [
+    "./src/bundle-entry.ts"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "clean": "rm -rf dist",
+    "build": "bun run clean && bun build ./src/index.ts ./src/bundle-entry.ts --target=browser --format=esm --outdir dist && tsc -p tsconfig.build.json && bun ../../scripts/fix-dts.ts dist",
+    "prepublishOnly": "bun run build"
+  }
+}

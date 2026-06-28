@@ -1,0 +1,17 @@
+{
+  "name": "tegis-js",
+  "private": true,
+  "type": "module",
+  "description": "Tegis JavaScript/TypeScript SDKs — @tegis/server (backend entitlement minting) + @tegis/player (browser hot path).",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "test": "bun test",
+    "build": "bun run --filter='@tegis/*' build"
+  },
+  "devDependencies": {
+    "@types/node": "^22",
+    "typescript": "^6"
+  }
+}
