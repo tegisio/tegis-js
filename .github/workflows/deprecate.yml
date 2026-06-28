@@ -1,0 +1,35 @@
+# Deprecate (or un-deprecate) a published @tegis/* version on npm.
+#
+# Manual trigger (Actions → "deprecate" → Run workflow). Uses the CI automation NPM_TOKEN, which bypasses
+# the interactive 2FA/web-auth that blocks `npm deprecate` from a local machine. Set an empty message to
+# UN-deprecate. Inputs are passed via env (not interpolated into the shell) to avoid script injection.
+name: deprecate
+
+on:
+  workflow_dispatch:
+    inputs:
+      spec:
+        description: "Package spec, e.g. @tegis/player@0.1.0"
+        required: true
+      message:
+        description: "Deprecation message (empty string un-deprecates)"
+        required: true
+        default: "broken build — use a newer version"
+
+permissions:
+  contents: read
+
+jobs:
+  deprecate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+      - name: npm deprecate
+        run: npm deprecate "$SPEC" "$MSG"
+        env:
+          SPEC: ${{ inputs.spec }}
+          MSG: ${{ inputs.message }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
