@@ -25,4 +25,4 @@ golden-vector parity test (`packages/server`) keeps the bundled crypto byte-iden
 Releases are published to npm from CI with [build provenance](https://docs.github.com/actions/security-guides/using-artifact-attestations)
 — verify any tarball with `gh attestation verify <tarball> --repo tegisio/tegis-js`.
 
-MIT © okbrk
+MIT © Tegis

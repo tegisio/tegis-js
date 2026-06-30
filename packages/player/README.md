@@ -54,4 +54,4 @@ A `@tegis/player/bundle` entry exposes `TegisPlayer` on `globalThis` for `<scrip
 Playback requires **real Chrome** (H.264 + MSE) — see the Tegis docs for the supported-browser matrix.
 Surface a clear unsupported-browser message to viewers on other engines.
 
-MIT © okbrk
+MIT © Tegis

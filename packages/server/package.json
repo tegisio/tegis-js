@@ -4,7 +4,7 @@
   "description": "Tegis backend SDK — mint short-lived, EdDSA-signed entitlement grants. The tenant signing key never leaves your server.",
   "type": "module",
   "license": "MIT",
-  "author": "okbrk <burak@okbrk.com>",
+  "author": "Tegis <admin@tegis.io>",
   "homepage": "https://tegis.io",
   "repository": {
     "type": "git",

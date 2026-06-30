@@ -44,4 +44,4 @@ The browser never sees `signSeed`; it only receives the short-lived `entitlement
 Treat `signSeed` like a private key: load it from a secret store, never log it, never ship it to the
 client. Rotate by publishing a new `kid` in your JWKS.
 
-MIT © okbrk
+MIT © Tegis
