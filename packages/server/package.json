@@ -1,6 +1,6 @@
 {
   "name": "@tegis/server",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Tegis backend SDK — mint short-lived, EdDSA-signed entitlement grants. The tenant signing key never leaves your server.",
   "type": "module",
   "license": "MIT",
