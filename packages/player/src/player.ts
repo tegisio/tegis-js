@@ -25,6 +25,10 @@ export interface Grant {
   manifest: string[]; // signed media-segment URLs
   window: { from: number; to: number };
   res: string;
+  /** Browser-only: outcome of the SDK's best-effort autoplay — `playing` (started as-is), `muted` (fell
+   *  back to muted because autoplay-with-audio was blocked), or `blocked` (needs a user gesture). Lets a
+   *  caller surface an unmute hint / play button instead of being left on a frozen frame. */
+  autoplay?: "playing" | "muted" | "blocked";
 }
 
 function randHex(n: number): string {
@@ -142,7 +146,23 @@ export class TegisPlayer {
       await append(seg);
     }
     ms.endOfStream();
-    await video.play().catch(() => {}); // autoplay may be blocked; callers assert buffered/currentTime
+    // Best-effort autoplay. Browsers block autoplay-with-audio when media engagement is low (e.g. an
+    // incognito session, MEI=0). Muted autoplay is always permitted, so on a block fall back to muted
+    // rather than leaving a frozen first frame; if it is still blocked, the element stays paused for the
+    // caller's play control. Report the outcome so the caller can surface an unmute/play affordance.
+    let autoplay: NonNullable<Grant["autoplay"]> = "playing";
+    try {
+      await video.play();
+    } catch {
+      video.muted = true;
+      try {
+        await video.play();
+        autoplay = "muted";
+      } catch {
+        autoplay = "blocked";
+      }
+    }
+    g.autoplay = autoplay;
     return g;
   }
 }
