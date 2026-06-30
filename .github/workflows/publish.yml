@@ -22,6 +22,13 @@ on:
           - server
           - player
         default: both
+      tag:
+        description: npm dist-tag (next = canary for demo.tegis.io; latest = release)
+        type: choice
+        options:
+          - latest
+          - next
+        default: latest
 
 permissions:
   contents: read
@@ -88,6 +95,6 @@ jobs:
       - name: Publish @tegis/${{ matrix.pkg }}
         if: ${{ success() && (inputs.package == 'both' || inputs.package == matrix.pkg) }}
         working-directory: packages/${{ matrix.pkg }}
-        run: npm publish "${{ steps.pack.outputs.tarball }}" --access public
+        run: npm publish "${{ steps.pack.outputs.tarball }}" --access public --tag ${{ inputs.tag }}
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
