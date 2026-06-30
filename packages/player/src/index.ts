@@ -5,3 +5,6 @@ export { TegisPlayer } from "./player.ts";
 export type { BrowserPlayerConfig, Grant } from "./player.ts";
 export { loadWasmHandshake, loadWhitenedHandshake } from "./handshake-wasm.ts";
 export type { HandshakeFn } from "./handshake-wasm.ts";
+
+// SDK build version — lets consumers introspect which @tegis/player they're running.
+export const VERSION = "0.1.4-next.1";

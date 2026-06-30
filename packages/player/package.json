@@ -1,6 +1,6 @@
 {
   "name": "@tegis/player",
-  "version": "0.1.4-next.0",
+  "version": "0.1.4-next.1",
   "description": "Tegis browser player SDK — attest → WASM handshake → mint → renew, with WebCrypto AES-CTR segment playback. Never holds a tenant key.",
   "type": "module",
   "license": "MIT",
