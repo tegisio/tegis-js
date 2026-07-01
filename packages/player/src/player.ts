@@ -15,6 +15,10 @@ export interface BrowserPlayerConfig {
   demoHeaders?: boolean; // dev only — send x-aegis-tenant/x-aegis-client-ip
   clientIp?: string;
   fetchImpl?: typeof fetch;
+  /** Client funnel telemetry (play→first-frame→watch-through→complete/error), beaconed to the edge for
+   *  the operator's e2e support view. Privacy-safe: only opaque ses/pbk/ast, never viewer PII. On by
+   *  default; set `false` to disable. */
+  telemetry?: boolean;
 }
 
 export interface Grant {
@@ -40,7 +44,47 @@ function randHex(n: number): string {
 export class TegisPlayer {
   private att?: string;
   private attSes?: string;
+  private evtSes?: string;
+  private evtPbk?: string;
+  private evtAst?: string;
+  private watched = new Set<number>();
   constructor(private cfg: BrowserPlayerConfig) {}
+
+  /** Beacon one client-funnel step to the edge (Spec 09 §2.3). Best-effort + fully guarded — telemetry
+   *  NEVER throws and never affects playback. sendBeacon avoids a CORS preflight + survives page unload. */
+  private beacon(step: string, reason?: string): void {
+    if (this.cfg.telemetry === false) return;
+    try {
+      const url = this.cfg.edge.replace(/\/+$/, "") + "/evt/v1";
+      const body = JSON.stringify({ ses: this.evtSes, pbk: this.evtPbk, ast: this.evtAst, step, reason });
+      if (typeof navigator !== "undefined" && typeof navigator.sendBeacon === "function") {
+        navigator.sendBeacon(url, body);
+      } else {
+        void this.f(url, { method: "POST", body, keepalive: true }).catch(() => {});
+      }
+    } catch {
+      /* telemetry is best-effort */
+    }
+  }
+
+  /** Attach the watch-through / first-frame / completion / error listeners once MSE is playing. */
+  private wireFunnel(video: HTMLVideoElement): void {
+    if (this.cfg.telemetry === false) return;
+    video.addEventListener("playing", () => this.beacon("first_frame"), { once: true });
+    video.addEventListener("ended", () => this.beacon("completed"), { once: true });
+    video.addEventListener("error", () => this.beacon("error", "media_error"), { once: true });
+    video.addEventListener("timeupdate", () => {
+      const d = video.duration;
+      if (!d || !isFinite(d)) return;
+      const pctBucket = Math.floor((video.currentTime / d) * 100);
+      for (const q of [25, 50, 75, 100]) {
+        if (pctBucket >= q && !this.watched.has(q)) {
+          this.watched.add(q);
+          this.beacon("watched_" + q);
+        }
+      }
+    });
+  }
 
   private get f(): typeof fetch {
     // bind to globalThis — browser fetch throws "Illegal invocation" if called with this !== window.
@@ -122,47 +166,70 @@ export class TegisPlayer {
    */
   async play(video: HTMLVideoElement, opts: { assetId: string; entitlement: string; ses?: string; fph?: string; mime?: string; token?: string }): Promise<Grant> {
     if (typeof MediaSource === "undefined") throw new Error("MSE unavailable in this environment");
-    const g = await this.mint(opts);
-    const key = await this.contentKey(opts.assetId);
-    const ms = new MediaSource();
-    video.src = URL.createObjectURL(ms);
-    await new Promise<void>((res) => ms.addEventListener("sourceopen", () => res(), { once: true }));
-    const mime = opts.mime ?? 'video/mp4; codecs="avc1.4d401e, mp4a.40.2"';
-    const sb = ms.addSourceBuffer(mime);
-    const append = (buf: Uint8Array) =>
-      new Promise<void>((res, rej) => {
-        sb.addEventListener("updateend", () => res(), { once: true });
-        sb.addEventListener("error", (e) => rej(e), { once: true });
-        sb.appendBuffer(buf as BufferSource);
-      });
-    await append(await this.fetchBytes(g.init)); // init segment (unencrypted codec config)
-    for (const url of g.manifest) {
-      let seg: Uint8Array;
-      try {
-        seg = await this.decryptedSegment(opts.assetId, url, key); // 404 ⇒ past the end of the packaged content
-      } catch {
-        break;
-      }
-      await append(seg);
-    }
-    ms.endOfStream();
-    // Best-effort autoplay. Browsers block autoplay-with-audio when media engagement is low (e.g. an
-    // incognito session, MEI=0). Muted autoplay is always permitted, so on a block fall back to muted
-    // rather than leaving a frozen first frame; if it is still blocked, the element stays paused for the
-    // caller's play control. Report the outcome so the caller can surface an unmute/play affordance.
-    let autoplay: NonNullable<Grant["autoplay"]> = "playing";
+    // Client funnel: tag every step with a stable ses (reused by mint), wire the video listeners, and
+    // emit play_requested at the click. All beacons are best-effort and never affect playback.
+    const ses = this.attSes ?? opts.ses ?? "ses_" + randHex(4);
+    this.evtSes = ses;
+    this.evtAst = opts.assetId;
+    this.evtPbk = undefined;
+    this.watched.clear();
+    this.wireFunnel(video);
+    this.beacon("play_requested");
     try {
-      await video.play();
-    } catch {
-      video.muted = true;
+      const g = await this.mint({ ...opts, ses });
+      this.evtSes = this.attSes ?? ses; // the ses the mint actually used
+      this.evtPbk = g.playbackId;
+      this.beacon("granted");
+      const key = await this.contentKey(opts.assetId);
+      const ms = new MediaSource();
+      video.src = URL.createObjectURL(ms);
+      await new Promise<void>((res) => ms.addEventListener("sourceopen", () => res(), { once: true }));
+      const mime = opts.mime ?? 'video/mp4; codecs="avc1.4d401e, mp4a.40.2"';
+      const sb = ms.addSourceBuffer(mime);
+      const append = (buf: Uint8Array) =>
+        new Promise<void>((res, rej) => {
+          sb.addEventListener("updateend", () => res(), { once: true });
+          sb.addEventListener("error", (e) => rej(e), { once: true });
+          sb.appendBuffer(buf as BufferSource);
+        });
+      await append(await this.fetchBytes(g.init)); // init segment (unencrypted codec config)
+      let firstSeg = true;
+      for (const url of g.manifest) {
+        let seg: Uint8Array;
+        try {
+          seg = await this.decryptedSegment(opts.assetId, url, key); // 404 ⇒ past the end of the packaged content
+        } catch {
+          break;
+        }
+        if (firstSeg) {
+          firstSeg = false;
+          this.beacon("first_segment_decrypted");
+        }
+        await append(seg);
+      }
+      ms.endOfStream();
+      // Best-effort autoplay. Browsers block autoplay-with-audio when media engagement is low (e.g. an
+      // incognito session, MEI=0). Muted autoplay is always permitted, so on a block fall back to muted
+      // rather than leaving a frozen first frame; if it is still blocked, the element stays paused for the
+      // caller's play control. Report the outcome so the caller can surface an unmute/play affordance.
+      let autoplay: NonNullable<Grant["autoplay"]> = "playing";
       try {
         await video.play();
-        autoplay = "muted";
       } catch {
-        autoplay = "blocked";
+        video.muted = true;
+        try {
+          await video.play();
+          autoplay = "muted";
+        } catch {
+          autoplay = "blocked";
+        }
       }
+      g.autoplay = autoplay;
+      return g;
+    } catch (e) {
+      // The playback pipeline failed client-side (mint/key/decrypt/MSE). Record where, for the trace.
+      this.beacon("error", e instanceof Error ? e.message.slice(0, 80) : "play_failed");
+      throw e;
     }
-    g.autoplay = autoplay;
-    return g;
   }
 }
