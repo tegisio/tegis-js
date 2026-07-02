@@ -5,6 +5,7 @@
 // real deployment routes by Host (F3) and never sets them.
 
 import { handshake as wcHandshake, hbSign, decryptSegment, unb64u } from "./crypto.ts";
+import { QoeCollector } from "./qoe.ts";
 
 export interface BrowserPlayerConfig {
   mint: string;
@@ -29,6 +30,9 @@ export interface BrowserPlayerConfig {
   onState?: (state: PlayerState) => void;
   /** Injectable backoff sleep (defaults to `setTimeout`). Lets tests drive the retry loop with fake timers. */
   delayFn?: (ms: number) => Promise<void>;
+  /** Injectable monotonic clock (ms) for QoE timing — TTFF (play-requested → first frame). Defaults to
+   *  `performance.now()`. Lets tests measure durations deterministically. */
+  now?: () => number;
 }
 
 /** Retry budget for JIT `preparing` tolerance (spec 12 §4.6). Defaults: maxAttempts 6, baseDelayMs 500,
@@ -94,7 +98,15 @@ export class TegisPlayer {
   private evtPbk?: string;
   private evtAst?: string;
   private watched = new Set<number>();
-  constructor(private cfg: BrowserPlayerConfig) {}
+  /** Per-playback QoE accumulator (TTFF / preparing / rebuffer). Reset at the start of every `play()`. */
+  private qoe: QoeCollector;
+  /** Guards the single terminal `client.qoe` beacon per playback (the completed/error vs. page-unload race). */
+  private qoeSent = false;
+  /** Ensures the page-unload QoE flush hooks are registered at most once per player. */
+  private qoeUnloadWired = false;
+  constructor(private cfg: BrowserPlayerConfig) {
+    this.qoe = new QoeCollector(cfg.now);
+  }
 
   /** Beacon one client-funnel step to the edge (Spec 09 §2.3). Best-effort + fully guarded — telemetry
    *  NEVER throws and never affects playback. sendBeacon avoids a CORS preflight + survives page unload. */
@@ -113,12 +125,91 @@ export class TegisPlayer {
     }
   }
 
+  /** Emit the ONE `client.qoe` beacon for this playback (BACKLOG-3 wire contract). Rides the exact same
+   *  client-event path + envelope as the funnel beacons — POST `/evt/v1` with `{ses,pbk,ast,step}` — so the
+   *  edge maps `step:"qoe"` → `client.qoe` and the ClickHouse ingest treats it uniformly. Best-effort +
+   *  idempotent: a `sent` flag guards the completed/error-vs-unload race so it fires at most once per
+   *  playback. Privacy-safe — only the opaque ses/pbk/ast + the QoE numbers; NEVER geo/IP/UA (the gateway
+   *  stamps viewer country server-side, D3). */
+  private emitQoe(): void {
+    if (this.cfg.telemetry === false) return;
+    if (this.qoeSent) return;
+    this.qoeSent = true;
+    try {
+      const url = this.cfg.edge.replace(/\/+$/, "") + "/evt/v1";
+      const q = this.qoe.snapshot();
+      const body = JSON.stringify({
+        ses: this.evtSes,
+        pbk: this.evtPbk,
+        ast: this.evtAst,
+        step: "qoe", // edge maps `client.` + step → `client.qoe`, same routing as every funnel step
+        ttff_ms: q.ttff_ms,
+        preparing_count: q.preparing_count,
+        preparing_ms: q.preparing_ms,
+        rebuffer_count: q.rebuffer_count,
+      });
+      if (typeof navigator !== "undefined" && typeof navigator.sendBeacon === "function") {
+        navigator.sendBeacon(url, body);
+      } else {
+        void this.f(url, { method: "POST", body, keepalive: true }).catch(() => {});
+      }
+    } catch {
+      /* QoE telemetry is best-effort — it must never affect playback */
+    }
+  }
+
+  /** Register the page-unload QoE flush once per player: a `pagehide` and a `visibilitychange`→hidden both
+   *  try to emit the terminal `client.qoe` beacon (idempotent via the `sent` flag) so a viewer who closes the
+   *  tab mid-playback is still counted. Browser-only + fully guarded; a no-op where there is no `document`. */
+  private wireUnloadQoe(): void {
+    if (this.cfg.telemetry === false || this.qoeUnloadWired) return;
+    if (typeof document === "undefined" || typeof document.addEventListener !== "function") return;
+    this.qoeUnloadWired = true;
+    try {
+      document.addEventListener("visibilitychange", () => {
+        if (document.visibilityState === "hidden") this.emitQoe();
+      });
+      if (typeof window !== "undefined" && typeof window.addEventListener === "function") {
+        window.addEventListener("pagehide", () => this.emitQoe());
+      }
+    } catch {
+      /* unload wiring is best-effort */
+    }
+  }
+
   /** Attach the watch-through / first-frame / completion / error listeners once MSE is playing. */
   private wireFunnel(video: HTMLVideoElement): void {
     if (this.cfg.telemetry === false) return;
-    video.addEventListener("playing", () => this.beacon("first_frame"), { once: true });
-    video.addEventListener("ended", () => this.beacon("completed"), { once: true });
-    video.addEventListener("error", () => this.beacon("error", "media_error"), { once: true });
+    // First frame: stamp TTFF + fire the funnel step. The mark is idempotent — only the first `playing` wins.
+    video.addEventListener(
+      "playing",
+      () => {
+        this.qoe.markFirstFrame();
+        this.beacon("first_frame");
+      },
+      { once: true },
+    );
+    // Rebuffer: a `waiting` AFTER the first frame is a post-start stall; before it, it's just initial buffering.
+    video.addEventListener("waiting", () => {
+      if (this.qoe.hasStarted()) this.qoe.addRebuffer();
+    });
+    // Terminal moments: emit the one-per-playback QoE beacon alongside the funnel completed/error step.
+    video.addEventListener(
+      "ended",
+      () => {
+        this.beacon("completed");
+        this.emitQoe();
+      },
+      { once: true },
+    );
+    video.addEventListener(
+      "error",
+      () => {
+        this.beacon("error", "media_error");
+        this.emitQoe();
+      },
+      { once: true },
+    );
     video.addEventListener("timeupdate", () => {
       const d = video.duration;
       if (!d || !isFinite(d)) return;
@@ -238,6 +329,7 @@ export class TegisPlayer {
       if (preparing && attempt < jit.maxAttempts) {
         attempt++;
         const retryAfterMs = this.retryDelayMs(r, attempt, jit);
+        this.qoe.addPreparing(retryAfterMs); // QoE: count this preparing occurrence + the ms it will wait
         this.emitState({ state: "preparing", url: full, attempt, maxAttempts: jit.maxAttempts, retryAfterMs });
         this.beacon("preparing", "jit"); // e2e funnel: cold segment still preparing (best-effort)
         await this.sleep(retryAfterMs);
@@ -281,7 +373,11 @@ export class TegisPlayer {
     this.evtAst = opts.assetId;
     this.evtPbk = undefined;
     this.watched.clear();
+    this.qoe.reset(); // fresh QoE accounting for this playback
+    this.qoeSent = false;
     this.wireFunnel(video);
+    this.wireUnloadQoe();
+    this.qoe.markPlayRequested(); // opens the TTFF span at the click, alongside the play_requested beacon
     this.beacon("play_requested");
     try {
       const g = await this.mint({ ...opts, ses });
@@ -337,6 +433,7 @@ export class TegisPlayer {
     } catch (e) {
       // The playback pipeline failed client-side (mint/key/decrypt/MSE). Record where, for the trace.
       this.beacon("error", e instanceof Error ? e.message.slice(0, 80) : "play_failed");
+      this.emitQoe(); // terminal: flush QoE for a client-side playback failure too
       throw e;
     }
   }
