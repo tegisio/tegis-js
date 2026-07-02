@@ -19,7 +19,53 @@ export interface BrowserPlayerConfig {
    *  the operator's e2e support view. Privacy-safe: only opaque ses/pbk/ast, never viewer PII. On by
    *  default; set `false` to disable. */
   telemetry?: boolean;
+  /** JIT tolerance (spec 12 §4.6): with a JIT origin (spec 14 §6.5 / task D1) a cold-segment request can
+   *  come back `preparing` (503 + `Retry-After`) instead of the bytes. The player treats that as a graceful
+   *  back-off + retry — NEVER a playback error. Tune the retry budget here; sane defaults apply when omitted. */
+  jit?: JitConfig;
+  /** State hook the tenant app can render. Fires `preparing` while a cold segment is being JIT-prepared (so
+   *  the app can show a "still preparing…" spinner) and `ready` once the bytes arrive. Best-effort: a throwing
+   *  hook is swallowed so it can never break playback. */
+  onState?: (state: PlayerState) => void;
+  /** Injectable backoff sleep (defaults to `setTimeout`). Lets tests drive the retry loop with fake timers. */
+  delayFn?: (ms: number) => Promise<void>;
 }
+
+/** Retry budget for JIT `preparing` tolerance (spec 12 §4.6). Defaults: maxAttempts 6, baseDelayMs 500,
+ *  maxDelayMs 8000 (also the ceiling that clamps a large upstream `Retry-After`). */
+export interface JitConfig {
+  /** Max `preparing` retries before giving up with a graceful terminal error. Default 6. */
+  maxAttempts?: number;
+  /** Base backoff used when the origin sends no `Retry-After`; grows exponentially. Default 500ms. */
+  baseDelayMs?: number;
+  /** Upper bound on any single backoff (also caps a large `Retry-After`). Default 8000ms. */
+  maxDelayMs?: number;
+}
+
+/** The segment is being JIT-prepared upstream — the host can render a "still preparing…" affordance. */
+export interface PreparingState {
+  state: "preparing";
+  /** Segment URL being prepared. */
+  url: string;
+  /** 1-based retry about to be waited out. */
+  attempt: number;
+  /** Retry-budget ceiling (from `jit.maxAttempts`). */
+  maxAttempts: number;
+  /** Backoff (ms) before the next attempt — honors `Retry-After` when present, else exponential; always
+   *  clamped to `jit.maxDelayMs`, so this is the real wait the player will observe. */
+  retryAfterMs: number;
+}
+
+/** A previously-`preparing` segment is now available (2xx) — the player transitions back to normal playback. */
+export interface ReadyState {
+  state: "ready";
+  url: string;
+  /** How many `preparing` retries it took to become ready. */
+  attempts: number;
+}
+
+/** JIT-aware segment-fetch state surfaced to the host via {@link BrowserPlayerConfig.onState}. */
+export type PlayerState = PreparingState | ReadyState;
 
 export interface Grant {
   grant: string;
@@ -140,10 +186,72 @@ export class TegisPlayer {
     if (r.status !== 200) throw new Error("key fetch failed: " + r.status);
     return unb64u((await r.json()).key);
   }
+  private jitOpts(): Required<JitConfig> {
+    return { maxAttempts: 6, baseDelayMs: 500, maxDelayMs: 8000, ...(this.cfg.jit ?? {}) };
+  }
+  /** A `preparing` origin response (spec 12 §4.6): the JIT edge (task D1) answers a cold-segment miss with
+   *  `503` (usually + `Retry-After`) or an explicit `preparing` marker — NEVER a 404. Tolerant by design. */
+  private isPreparing(r: Response): boolean {
+    if (r.status === 503) return true;
+    const marker = (r.headers.get("x-tegis-status") ?? r.headers.get("x-aegis-status") ?? "").toLowerCase();
+    return marker === "preparing";
+  }
+  /** Backoff before the next attempt: honor `Retry-After` (delta-seconds or HTTP-date) when present, else a
+   *  bounded exponential backoff. Always clamped to [0, maxDelayMs]. */
+  private retryDelayMs(r: Response, attempt: number, jit: Required<JitConfig>): number {
+    const ra = r.headers.get("retry-after");
+    if (ra != null && ra !== "") {
+      const secs = Number(ra);
+      const ms = Number.isFinite(secs) ? secs * 1000 : Date.parse(ra) - Date.now();
+      if (Number.isFinite(ms)) return Math.max(0, Math.min(ms, jit.maxDelayMs));
+    }
+    return Math.min(jit.baseDelayMs * 2 ** (attempt - 1), jit.maxDelayMs);
+  }
+  private sleep(ms: number): Promise<void> {
+    return this.cfg.delayFn ? this.cfg.delayFn(ms) : new Promise((res) => setTimeout(res, ms));
+  }
+  private emitState(s: PlayerState): void {
+    try {
+      this.cfg.onState?.(s);
+    } catch {
+      /* a host state hook must never break playback */
+    }
+  }
+  /**
+   * Fetch raw segment/origin bytes — JIT-aware (spec 12 §4.6). A `preparing` response (503 + `Retry-After`,
+   * or a `preparing` marker) is NOT an error: the player backs off and retries (honoring `Retry-After`, else
+   * a capped exponential backoff) up to `jit.maxAttempts`, firing the `preparing` state hook while it waits
+   * and a `ready` state once the bytes arrive. Exhausted retries throw a graceful terminal error (flagged
+   * `preparing`); a genuine non-2xx throws immediately.
+   */
   async fetchBytes(url: string): Promise<Uint8Array> {
-    const r = await this.f(url.startsWith("http") ? url : this.cfg.edge + url, { headers: this.hdr() });
-    if (r.status !== 200) throw new Error("fetch failed " + r.status + ": " + url);
-    return new Uint8Array(await r.arrayBuffer());
+    const full = url.startsWith("http") ? url : this.cfg.edge + url;
+    const jit = this.jitOpts();
+    let attempt = 0;
+    for (;;) {
+      const r = await this.f(full, { headers: this.hdr() });
+      if (r.status === 200) {
+        if (attempt > 0) this.emitState({ state: "ready", url: full, attempts: attempt });
+        return new Uint8Array(await r.arrayBuffer());
+      }
+      const preparing = this.isPreparing(r);
+      if (preparing && attempt < jit.maxAttempts) {
+        attempt++;
+        const retryAfterMs = this.retryDelayMs(r, attempt, jit);
+        this.emitState({ state: "preparing", url: full, attempt, maxAttempts: jit.maxAttempts, retryAfterMs });
+        this.beacon("preparing", "jit"); // e2e funnel: cold segment still preparing (best-effort)
+        await this.sleep(retryAfterMs);
+        continue;
+      }
+      if (preparing) {
+        const err = new Error(`segment still preparing after ${jit.maxAttempts} attempts: ${full}`) as Error & {
+          preparing?: boolean;
+        };
+        err.preparing = true;
+        throw err;
+      }
+      throw new Error("fetch failed " + r.status + ": " + full);
+    }
   }
   /** The headless-verifiable core: fetch a media segment from the edge/CDN + decrypt it with WebCrypto. */
   async decryptedSegment(assetId: string, url: string, key?: Uint8Array): Promise<Uint8Array> {
