@@ -365,6 +365,11 @@ export class TegisPlayer {
    * each media segment → play. The att-gated key is fetched once. Returns the grant.
    */
   async play(video: HTMLVideoElement, opts: { assetId: string; entitlement: string; ses?: string; fph?: string; mime?: string; token?: string }): Promise<Grant> {
+    // Fail fast with a clear message if the caller passed no element — otherwise the first thing we do
+    // (wireFunnel's video.addEventListener) throws the cryptic "Cannot read properties of null (reading
+    // 'addEventListener')". The element must exist before play() (e.g. a caller whose <video> mounts async
+    // must await it — see the demo player-dialog).
+    if (!video) throw new Error("play: a video element is required");
     if (typeof MediaSource === "undefined") throw new Error("MSE unavailable in this environment");
     // Client funnel: tag every step with a stable ses (reused by mint), wire the video listeners, and
     // emit play_requested at the click. All beacons are best-effort and never affect playback.

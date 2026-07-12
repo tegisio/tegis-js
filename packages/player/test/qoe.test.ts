@@ -54,6 +54,15 @@ const preparing = (retryAfter?: string) => () =>
 const ready = (bytes: Uint8Array) => () => new Response(bytes, { status: 200 });
 const qoeOf = (beacons: Beacon[]): Beacon[] => beacons.filter((b) => b.step === "qoe");
 
+test("play() throws a clear error when passed no video element (guards the wireFunnel null.addEventListener crash)", () => {
+  const { player } = makePlayer([]);
+  // A caller whose <video> mounts async (e.g. a React portal) can hand play() a null ref; assert it fails
+  // fast with an actionable message instead of "Cannot read properties of null (reading 'addEventListener')".
+  expect(
+    player.play(null as unknown as HTMLVideoElement, { assetId: "ast_1", entitlement: "ent" }),
+  ).rejects.toThrow("a video element is required");
+});
+
 test("QoeCollector: TTFF math, hasStarted gate, preparing + rebuffer accumulation, reset", () => {
   let t = 500;
   const c = new QoeCollector(() => t);
