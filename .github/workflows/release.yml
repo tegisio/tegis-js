@@ -1,0 +1,134 @@
+# One-button release for the Tegis SDK packages (@tegis/player, @tegis/server).
+#
+# Actions → "release" → Run workflow: pick the package(s), the semver bump, and the npm dist-tag.
+# CI then: runs tests, bumps the version, builds, verifies the bundle is real, PUBLISHES to npm via
+# OIDC Trusted Publishing (no token, no OTP — provenance is automatic), then commits + tags + pushes
+# the bump so `main` always reflects what's on npm. Zero local steps.
+#
+# ── ONE-TIME SETUP (per package, before the first run) ────────────────────────────────────────────
+# On npmjs.com → the package → Settings → "Trusted Publisher" → GitHub Actions, set:
+#     Organization or user:  tegisio
+#     Repository:            tegis-js
+#     Workflow filename:     release.yml
+#     Environment:           (leave blank)
+# Do this for BOTH @tegis/player and @tegis/server. The packages must already exist on npm (they do).
+# After the first green OIDC release you can delete the old token-based publish.yml.
+# ──────────────────────────────────────────────────────────────────────────────────────────────────
+
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      package:
+        description: Which package(s) to release
+        type: choice
+        options: [both, player, server]
+        default: player
+      bump:
+        description: Semver bump (none = publish the current package.json version as-is)
+        type: choice
+        options: [patch, minor, major, prerelease, none]
+        default: patch
+      tag:
+        description: npm dist-tag (latest = release, next = canary for demo.tegis.io)
+        type: choice
+        options: [latest, next]
+        default: latest
+
+permissions:
+  contents: write # commit + push the version bump + tags
+  id-token: write # OIDC → npm Trusted Publishing (+ automatic provenance)
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.5" # pinned: newer bun changed `bun build` + shipped non-bundled stubs
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+
+      # OIDC Trusted Publishing needs npm >= 11.5.1; node 22 ships an older npm. No NODE_AUTH_TOKEN is set,
+      # so `npm publish` authenticates via the workflow's OIDC id-token instead of a long-lived secret.
+      - name: Upgrade npm for OIDC Trusted Publishing
+        run: npm install -g npm@latest && npm --version
+
+      - name: Install workspace
+        run: bun install --frozen-lockfile
+
+      - name: Resolve package list
+        id: sel
+        run: |
+          case "${{ inputs.package }}" in
+            both) echo "list=player server" >> "$GITHUB_OUTPUT" ;;
+            *)    echo "list=${{ inputs.package }}" >> "$GITHUB_OUTPUT" ;;
+          esac
+
+      - name: Test → bump → build → verify → publish
+        id: rel
+        run: |
+          set -euo pipefail
+          BUMP='${{ inputs.bump }}'
+          TAG='${{ inputs.tag }}'
+          summary=""
+          for pkg in ${{ steps.sel.outputs.list }}; do
+            echo "::group::@tegis/$pkg"
+            pushd "packages/$pkg" >/dev/null
+
+            bun test                                   # quality gate — a red suite blocks the publish
+
+            if [ "$BUMP" = "prerelease" ]; then
+              npm version prerelease --preid="$TAG" --no-git-tag-version >/dev/null
+            elif [ "$BUMP" != "none" ]; then
+              npm version "$BUMP" --no-git-tag-version >/dev/null
+            fi                                           # none = publish package.json as-is
+            ver="$(node -p 'require("./package.json").version')"
+
+            bun run build
+            # Bundle-real guard (mirrors the retired publish.yml): fail loudly on a stub bundle.
+            if [ "$pkg" = "server" ]; then
+              bun -e 'import{TegisServer}from"./dist/index.js";if(typeof TegisServer!=="function")throw new Error("broken server bundle")'
+            else
+              bun -e 'import{TegisPlayer,loadWasmHandshake}from"./dist/index.js";if(typeof TegisPlayer!=="function"||typeof loadWasmHandshake!=="function")throw new Error("broken player bundle")'
+            fi
+
+            npm publish --access public --tag "$TAG" --provenance   # OIDC: no token, no OTP
+
+            popd >/dev/null
+            summary="${summary}@tegis/${pkg}@${ver} "
+            echo "::endgroup::"
+          done
+          echo "summary=${summary% }" >> "$GITHUB_OUTPUT"
+
+      - name: Commit + tag + push the bump
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add packages/*/package.json
+          # bump=none makes no source change → nothing to commit; still tag + push the published versions.
+          if ! git diff --cached --quiet; then
+            git commit -m "release: ${{ steps.rel.outputs.summary }} [skip ci]"
+            git push origin "HEAD:${{ github.ref_name }}"
+          fi
+          for pkg in ${{ steps.sel.outputs.list }}; do
+            ver="$(node -p "require('./packages/$pkg/package.json').version")"
+            git tag "@tegis/$pkg@$ver" 2>/dev/null && git push origin "@tegis/$pkg@$ver" \
+              || echo "tag @tegis/$pkg@$ver already exists — skipping"
+          done
+
+      - name: Summary
+        run: echo "### Released ${{ steps.rel.outputs.summary }} (dist-tag \`${{ inputs.tag }}\`)" >> "$GITHUB_STEP_SUMMARY"
