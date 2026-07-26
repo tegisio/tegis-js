@@ -461,15 +461,56 @@ export class TegisPlayer {
       const ms = createMediaSource();
       attachMediaSource(video, ms);
       await new Promise<void>((res) => ms.addEventListener("sourceopen", () => res(), { once: true }));
-      const mime = opts.mime ?? 'video/mp4; codecs="avc1.4d401e, mp4a.40.2"';
+      // Derive the SourceBuffer codec from the init segment's `moov` (its real avcC/esds) instead of a
+      // hardcoded guess: a wrong `codecs=` — e.g. Main@L3 declared for 1080p High, or a phantom audio codec
+      // on a video-only asset — lets the browser ACCEPT the append but silently fail to decode (frozen frame,
+      // nothing thrown). An explicit opts.mime still wins; codecsFromInit is the derive; DEFAULT_MIME is the
+      // last resort; isTypeSupported turns an undecodable codec into a clear throw rather than a hang.
+      const initBytes = await this.fetchBytes(g.init); // init segment (unencrypted codec config)
+      const mime = opts.mime ?? codecsFromInit(initBytes) ?? DEFAULT_MIME;
+      if (!msTypeSupported(ms, mime)) {
+        throw new Error(`play: this browser can't decode the content codec (${mime}) — isTypeSupported === false`);
+      }
       const sb = ms.addSourceBuffer(mime);
       const append = (buf: Uint8Array) =>
         new Promise<void>((res, rej) => {
-          sb.addEventListener("updateend", () => res(), { once: true });
-          sb.addEventListener("error", (e) => rej(e), { once: true });
-          sb.appendBuffer(buf as BufferSource);
+          const onEnd = () => {
+            sb.removeEventListener("error", onErr);
+            res();
+          };
+          const onErr = () => {
+            sb.removeEventListener("updateend", onEnd);
+            rej(new Error(`play: SourceBuffer append failed (codec "${mime}")`));
+          };
+          sb.addEventListener("updateend", onEnd, { once: true });
+          sb.addEventListener("error", onErr, { once: true });
+          try {
+            sb.appendBuffer(buf as BufferSource);
+          } catch (e) {
+            // A synchronous QuotaExceeded / InvalidState throw must reject — not escape as an unhandled error.
+            sb.removeEventListener("updateend", onEnd);
+            sb.removeEventListener("error", onErr);
+            rej(e);
+          }
         });
-      await append(await this.fetchBytes(g.init)); // init segment (unencrypted codec config)
+      // A decode/format failure surfaces as a MediaError on the <video> element — NOT the SourceBuffer's
+      // `error` event — so without this the first frame just freezes with nothing thrown. Race it against the
+      // initial (decode-sensitive) appends so a mismatch throws a legible reason; the renewal pump's
+      // awaitDrain owns errors for later windows, so the guard is scoped to init and torn down right after.
+      let mediaErrHandler: (() => void) | undefined;
+      const mediaError = new Promise<never>((_res, rej) => {
+        mediaErrHandler = () => {
+          const e = video.error;
+          rej(
+            new Error(
+              `play: MSE playback error${e ? ` (MediaError ${e.code}${e.message ? ": " + e.message : ""})` : ""}` +
+                ` — appended media failed to decode; SourceBuffer codec "${mime}" may not match the content`,
+            ),
+          );
+        };
+        video.addEventListener("error", mediaErrHandler);
+      });
+      mediaError.catch(() => {}); // a late fire (during the detached pump) must never be an unhandled rejection
       let firstSeg = true;
       const markFirst = () => {
         if (firstSeg) {
@@ -479,7 +520,16 @@ export class TegisPlayer {
       };
       // Window 1 — the first grant window (the lead buffer). `reachedEnd` is true when this window already ran
       // off the end of the packaged content (a segment 404): a SHORT asset that fits one grant window.
-      const reachedEnd = await this.appendSegments(opts.assetId, g.manifest, key, append, markFirst);
+      let reachedEnd: boolean;
+      try {
+        await Promise.race([append(initBytes), mediaError]);
+        reachedEnd = await Promise.race([
+          this.appendSegments(opts.assetId, g.manifest, key, append, markFirst),
+          mediaError,
+        ]);
+      } finally {
+        if (mediaErrHandler) video.removeEventListener("error", mediaErrHandler);
+      }
 
       const endStream = () => {
         if (ms.readyState === "open") {
@@ -567,6 +617,164 @@ export function attachMediaSource(video: HTMLVideoElement, ms: MediaSource): "sr
   }
   video.src = URL.createObjectURL(ms);
   return "objectURL";
+}
+
+// ---- SourceBuffer codec derivation (browser + headless-testable) ----------------------------------------
+
+/** Last-resort SourceBuffer codec, used only when the caller passes no `mime` AND the init segment can't be
+ *  parsed. H.264 High@L4.0 + AAC-LC fits typical 1080p output far better than the old Main@L3.0 guess. */
+const DEFAULT_MIME = 'video/mp4; codecs="avc1.640028,mp4a.40.2"';
+
+/** `MediaSource.isTypeSupported` via the CONSTRUCTOR actually in use (ManagedMediaSource on iOS has its own).
+ *  Returns true when the platform exposes no `isTypeSupported` — never block playback on a missing probe. */
+function msTypeSupported(ms: MediaSource, mime: string): boolean {
+  const ctor = (ms as unknown as { constructor?: { isTypeSupported?: (t: string) => boolean } }).constructor;
+  const fn = ctor?.isTypeSupported;
+  return typeof fn === "function" ? fn.call(ctor, mime) : true;
+}
+
+// ---- minimal ISO-BMFF (fMP4) box reader — just enough of `moov` to read the codec strings ----------------
+
+const u32 = (b: Uint8Array, o: number): number => b[o] * 0x1000000 + (b[o + 1] << 16) + (b[o + 2] << 8) + b[o + 3];
+const boxType = (b: Uint8Array, o: number): string => String.fromCharCode(b[o], b[o + 1], b[o + 2], b[o + 3]);
+const hex2 = (n: number): string => (n & 0xff).toString(16).padStart(2, "0");
+
+/** Iterate the boxes in [start, end): `fn(type, payloadStart, payloadEnd)`. Handles 32-bit, 64-bit
+ *  (`size===1`) and to-end (`size===0`) box sizes; stops on any malformed length. */
+function eachBox(b: Uint8Array, start: number, end: number, fn: (type: string, ps: number, pe: number) => void): void {
+  let o = start;
+  while (o + 8 <= end) {
+    let size = u32(b, o);
+    const type = boxType(b, o + 4);
+    let hdr = 8;
+    if (size === 1) {
+      size = u32(b, o + 8) * 0x100000000 + u32(b, o + 12); // 64-bit; init segments never approach 2^53
+      hdr = 16;
+    } else if (size === 0) {
+      size = end - o; // extends to the end of the container
+    }
+    if (size < hdr || o + size > end) break;
+    fn(type, o + hdr, o + size);
+    o += size;
+  }
+}
+
+/** Descend a fixed chain of container boxes (e.g. mdia→minf→stbl→stsd), calling `fn(payloadStart, end)` for
+ *  each leaf that matches the whole path. */
+function findPath(b: Uint8Array, start: number, end: number, path: string[], fn: (ps: number, pe: number) => void): void {
+  if (path.length === 0) {
+    fn(start, end);
+    return;
+  }
+  eachBox(b, start, end, (t, ps, pe) => {
+    if (t === path[0]) findPath(b, ps, pe, path.slice(1), fn);
+  });
+}
+
+/** Read the AAC audioObjectType out of an `esds` payload (after its 4-byte version/flags), walking the
+ *  ES_Descriptor → DecoderConfigDescriptor → DecoderSpecificInfo chain. Returns the AOT, or null (caller
+ *  defaults to AAC-LC). */
+function aacObjectType(b: Uint8Array, o: number, end: number): number | null {
+  const readLen = (p: number): [number, number] => {
+    let len = 0;
+    for (let i = 0; i < 4 && p < end; i++) {
+      const c = b[p++];
+      len = (len << 7) | (c & 0x7f);
+      if (!(c & 0x80)) break;
+    }
+    return [len, p];
+  };
+  let p = o;
+  if (b[p] === 0x03) {
+    // ES_Descriptor: length, ES_ID(2), flags(1), then optional dependency/URL/OCR fields.
+    p++;
+    p = readLen(p)[1];
+    p += 2;
+    const flags = b[p++];
+    if (flags & 0x80) p += 2; // dependsOn_ES_ID
+    if (flags & 0x40) p += 1 + (b[p] ?? 0); // URL (length-prefixed)
+    if (flags & 0x20) p += 2; // OCR_ES_ID
+  }
+  if (b[p] === 0x04) {
+    // DecoderConfigDescriptor: length, objectTypeIndication(1), streamType/bufferSize(4), max/avgBitrate(8).
+    p++;
+    p = readLen(p)[1];
+    p += 1 + 4 + 4 + 4;
+  }
+  if (b[p] === 0x05) {
+    // DecoderSpecificInfo = AudioSpecificConfig; the first 5 bits are the audioObjectType.
+    p++;
+    p = readLen(p)[1];
+    const aot = (b[p] >> 3) & 0x1f;
+    return aot || null;
+  }
+  return null;
+}
+
+const VIDEO_4CC = new Set(["avc1", "avc3", "hvc1", "hev1", "av01", "vp08", "vp09"]);
+
+/** Classify one sample entry and return its codec string. Fully parses H.264 (`avc1`/`avc3` via `avcC`) and
+ *  AAC (`mp4a` via `esds`); a video entry we can't decode into a codec returns `{kind:"video", codec:null}`
+ *  so the caller declines to derive rather than emit a wrong/partial mime. */
+function codecFromSampleEntry(b: Uint8Array, type: string, ps: number, pe: number): { kind: "video" | "audio"; codec: string | null } | null {
+  if (type === "avc1" || type === "avc3") {
+    let codec: string | null = null;
+    eachBox(b, ps + 78, pe, (t, cps) => {
+      // VisualSampleEntry has a 78-byte fixed header before its child boxes; avcC carries profile/level.
+      if (t === "avcC") codec = `${type}.${hex2(b[cps + 1])}${hex2(b[cps + 2])}${hex2(b[cps + 3])}`;
+    });
+    return { kind: "video", codec };
+  }
+  if (VIDEO_4CC.has(type)) return { kind: "video", codec: null }; // HEVC/AV1/VP9 seen but not derived → decline
+  if (type === "mp4a") {
+    let aot = 2; // AAC-LC default
+    eachBox(b, ps + 28, pe, (t, cps, cpe) => {
+      // AudioSampleEntry (v0) has a 28-byte fixed header before its child boxes; esds carries the AOT.
+      if (t === "esds") aot = aacObjectType(b, cps + 4, cpe) ?? aot;
+    });
+    return { kind: "audio", codec: `mp4a.40.${aot}` };
+  }
+  return null;
+}
+
+/**
+ * Parse an fMP4 (ISO-BMFF) init segment's `moov` and return an MSE mime reflecting the ACTUAL codecs present —
+ * e.g. `video/mp4; codecs="avc1.640028,mp4a.40.2"` — or null when it can't be determined (caller falls back
+ * to opts.mime / DEFAULT_MIME). Crucially it OMITS audio when the init has no audio track (declaring phantom
+ * audio stalls the SourceBuffer), and declines (returns null) when a video track is present but its codec
+ * can't be read, rather than emitting a wrong string. Pure + headless-testable.
+ */
+export function codecsFromInit(init: Uint8Array): string | null {
+  if (!init || init.length < 8) return null;
+  let video: string | undefined;
+  let audio: string | undefined;
+  let sawVideo = false;
+  try {
+    eachBox(init, 0, init.length, (type, ps, pe) => {
+      if (type !== "moov") return;
+      eachBox(init, ps, pe, (t2, ps2, pe2) => {
+        if (t2 !== "trak") return;
+        findPath(init, ps2, pe2, ["mdia", "minf", "stbl", "stsd"], (sps, spe) => {
+          // stsd is a FullBox: version(1)+flags(3)+entry_count(4) precede the sample entries.
+          eachBox(init, sps + 8, spe, (setype, seps, sepe) => {
+            const c = codecFromSampleEntry(init, setype, seps, sepe);
+            if (!c) return;
+            if (c.kind === "video") {
+              sawVideo = true;
+              if (c.codec && !video) video = c.codec;
+            } else if (c.codec && !audio) {
+              audio = c.codec;
+            }
+          });
+        });
+      });
+    });
+  } catch {
+    return null;
+  }
+  if (sawVideo && !video) return null; // a video track we couldn't parse → don't guess
+  const list = [video, audio].filter(Boolean) as string[];
+  return list.length ? `video/mp4; codecs="${list.join(",")}"` : null;
 }
 
 /** A signed playback window returned by mint `/mint/v1` (grant) or `/mint/v1/renew`: the media-segment URLs
