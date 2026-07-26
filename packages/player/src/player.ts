@@ -76,6 +76,10 @@ export interface Grant {
   playbackId: string;
   hbKeyB64u: string;
   init: string; // signed init-segment URL (F1: needed for MSE)
+  /** Signed, single-use content-key URL. Present when the edge enforces `AEGIS_KEY_REQUIRE_SIGNED`, which
+   *  rejects the att-gated bearer endpoint (`/key/v1/:asset?att=`) with 403 — the key must be fetched from
+   *  this URL instead. `play()` prefers it automatically; see {@link TegisPlayer.contentKey}. */
+  key?: string;
   manifest: string[]; // signed media-segment URLs
   window: { from: number; to: number };
   res: string;
@@ -376,9 +380,17 @@ export class TegisPlayer {
     return r.json as Grant;
   }
 
-  /** Fetch the att-gated content key (AES-128, 16 bytes). */
-  async contentKey(assetId: string, signal?: AbortSignal): Promise<Uint8Array> {
-    const r = await this.f(`${this.cfg.mint}/key/v1/${assetId}?att=${this.att}`, { headers: this.hdr(), signal });
+  /**
+   * Fetch the content key (AES-128, 16 bytes). Prefers the single-use SIGNED key URL from the mint grant
+   * (`grant.key`) when one is passed — REQUIRED when the edge enforces `AEGIS_KEY_REQUIRE_SIGNED`, which
+   * rejects the att-gated bearer endpoint with 403. Falls back to the att-gated endpoint when there is no
+   * signed URL (edges that don't enforce signed keys). The signed URL is self-authenticating, so it's
+   * fetched WITHOUT auth headers — keeping it a simple, preflight-free cross-origin GET.
+   */
+  async contentKey(assetId: string, signal?: AbortSignal, signedUrl?: string): Promise<Uint8Array> {
+    const r = signedUrl
+      ? await this.f(signedUrl.startsWith("http") ? signedUrl : this.cfg.mint + signedUrl, { signal })
+      : await this.f(`${this.cfg.mint}/key/v1/${assetId}?att=${this.att}`, { headers: this.hdr(), signal });
     if (r.status !== 200) throw new Error("key fetch failed: " + r.status);
     return unb64u((await r.json()).key);
   }
@@ -666,7 +678,10 @@ export class TegisPlayer {
       this.evtSes = this.attSes ?? ses;
       this.evtPbk = g.playbackId;
       this.beacon("granted");
-      const key = await this.contentKey(opts.assetId, signal);
+      // Prefer the grant's signed single-use key URL (required under AEGIS_KEY_REQUIRE_SIGNED); the
+      // att-gated endpoint is the fallback for edges that don't enforce signed keys. Fetched once here
+      // and reused for every segment + window renewal, so a single-use URL is safe.
+      const key = await this.contentKey(opts.assetId, signal, g.key);
       throwIfAborted(signal);
 
       ms = createMediaSource();
