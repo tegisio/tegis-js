@@ -18,4 +18,4 @@ export type { HandshakeFn } from "./handshake-wasm.ts";
 
 // SDK build version — lets consumers introspect which @tegis/player they're running. Kept in sync with
 // package.json by the release workflow's version bump.
-export const VERSION = "0.2.3";
+export const VERSION = "0.2.4";
