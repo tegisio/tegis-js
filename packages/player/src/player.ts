@@ -91,6 +91,105 @@ function randHex(n: number): string {
   return [...b].map((x) => x.toString(16).padStart(2, "0")).join("");
 }
 
+/** A legible playback failure surfaced via {@link PlayOpts.onError} (and console). `code` is a stable slug,
+ *  `message` is human-readable, `cause` is the underlying error/MediaError when there is one. */
+export interface PlayError {
+  code:
+    | "codec_unsupported"
+    | "decode"
+    | "segment_fetch"
+    | "append"
+    | "no_first_frame"
+    | "stalled"
+    | "play_failed";
+  message: string;
+  cause?: unknown;
+}
+
+/** Options for {@link TegisPlayer.play}. Only `assetId` + `entitlement` are required; the rest tune element
+ *  setup, autoplay, teardown, and callbacks. Progressive streaming, multi-window continuity, and buffer
+ *  pacing are all handled internally — the caller just supplies a `<video>` and these. */
+export interface PlayOpts {
+  assetId: string;
+  entitlement: string;
+  ses?: string;
+  fph?: string;
+  token?: string;
+  /** Override the SourceBuffer codec. Default: derived from the init segment (video-only H.264 supported). */
+  mime?: string;
+  loop?: boolean;
+  muted?: boolean;
+  /** Set `playsinline` (default true — required for inline autoplay on iOS). Pass `false` to opt out. */
+  playsInline?: boolean;
+  /** Abort playback + tear everything down: in-flight fetch/decrypt/append cancelled, element detached.
+   *  Equivalent to calling `handle.stop()`. Ideal for a scroll feed that mounts/unmounts constantly. */
+  signal?: AbortSignal;
+  /** Legible failure callback (also logged to console). Never throws into playback. */
+  onError?: (e: PlayError) => void;
+  /** Fires once, when the first frame is actually presented (the `playing` event). */
+  onFirstFrame?: () => void;
+}
+
+/** Returned by {@link TegisPlayer.play}: a superset of {@link Grant} plus `stop()` for full teardown. */
+export interface PlaybackHandle extends Grant {
+  /** Idempotent, abortable teardown: pause, detach the MediaSource, cancel all in-flight work. */
+  stop(): Promise<void>;
+}
+
+// Buffer pacing + watchdog tuning (browser hot path). HIGH_WATER caps how far ahead the feed loop fetches
+// (back-pressure); the watchdogs surface a legible error instead of a silent hang.
+const HIGH_WATER_S = 24; // stop fetching once this many seconds are buffered ahead of the playhead
+const FIRST_FRAME_TIMEOUT_MS = 12_000; // after the first segment is appended + play(), expect a frame within this
+const STALL_MS = 8_000; // currentTime stuck this long WITH buffered data ahead = a real (surfaced) stall
+
+/** An AbortError, cross-env (DOMException where present, else a tagged Error). */
+function abortError(): Error {
+  try {
+    return new DOMException("aborted", "AbortError");
+  } catch {
+    const e = new Error("aborted");
+    e.name = "AbortError";
+    return e;
+  }
+}
+function isAbort(e: unknown): boolean {
+  return e instanceof Error && e.name === "AbortError";
+}
+function throwIfAborted(signal: AbortSignal): void {
+  if (signal.aborted) throw abortError();
+}
+
+/** Await a one-shot event, rejecting if the signal aborts first. */
+function onceEvent(target: EventTarget, name: string, signal: AbortSignal): Promise<void> {
+  return new Promise((res, rej) => {
+    if (signal.aborted) return rej(abortError());
+    const on = () => {
+      cleanup();
+      res();
+    };
+    const onAbort = () => {
+      cleanup();
+      rej(abortError());
+    };
+    const cleanup = () => {
+      target.removeEventListener(name, on);
+      signal.removeEventListener("abort", onAbort);
+    };
+    target.addEventListener(name, on, { once: true });
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+/** A failed segment fetch is the stream's TRUE end (`"end"`) when it is a 404 past the sealed content or a
+ *  phantom trailing segment (JIT `preparing` budget exhausted); any other failure is a real `"error"`. */
+function classifyFetchError(e: unknown): "end" | "error" {
+  if (e instanceof Error) {
+    if ((e as Error & { preparing?: boolean }).preparing === true) return "end"; // phantom: never produced
+    if (/\bfetch failed 404\b/.test(e.message)) return "end"; // past the sealed content
+  }
+  return "error";
+}
+
 export class TegisPlayer {
   private att?: string;
   private attSes?: string;
@@ -235,8 +334,8 @@ export class TegisPlayer {
     }
     return h;
   }
-  private async post(path: string, body: unknown) {
-    const r = await this.f(this.cfg.mint + path, { method: "POST", headers: this.hdr(), body: JSON.stringify(body) });
+  private async post(path: string, body: unknown, signal?: AbortSignal) {
+    const r = await this.f(this.cfg.mint + path, { method: "POST", headers: this.hdr(), body: JSON.stringify(body), signal });
     return { status: r.status, json: (await r.json().catch(() => ({}))) as any };
   }
   private handshake(att: string, ent: string, nonce: string, t: number): Promise<string> {
@@ -244,7 +343,10 @@ export class TegisPlayer {
   }
 
   /** Pre-warm attestation OFF the click→play path (F1 §3): solve the bot-wall at page load, hold the att. */
-  async prewarm(opts: { ses?: string; fph?: string; nonce?: string; solution?: string; token?: string } = {}): Promise<string> {
+  async prewarm(
+    opts: { ses?: string; fph?: string; nonce?: string; solution?: string; token?: string } = {},
+    signal?: AbortSignal,
+  ): Promise<string> {
     const ses = opts.ses ?? "ses_" + randHex(4);
     const body: any = { ses, fph: opts.fph ?? "fp_" + ses };
     if (opts.solution) {
@@ -252,7 +354,7 @@ export class TegisPlayer {
       body.solution = opts.solution;
     }
     if (opts.token) body.token = opts.token; // F2: Cloudflare Turnstile token (the mint verifies it via siteverify)
-    const r = await this.post("/attest/v1/verify", body);
+    const r = await this.post("/attest/v1/verify", body, signal);
     if (!r.json.att) throw new Error("attestation failed: " + JSON.stringify(r.json));
     this.att = r.json.att;
     this.attSes = ses;
@@ -260,20 +362,23 @@ export class TegisPlayer {
   }
 
   /** Mint a playback grant for an asset (pre-warms inline if not already warm). */
-  async mint(opts: { assetId: string; entitlement: string; ses?: string; fph?: string; token?: string }): Promise<Grant> {
+  async mint(
+    opts: { assetId: string; entitlement: string; ses?: string; fph?: string; token?: string },
+    signal?: AbortSignal,
+  ): Promise<Grant> {
     const ses = this.attSes ?? opts.ses ?? "ses_" + randHex(4);
-    if (!this.att) await this.prewarm({ ses, fph: opts.fph, token: opts.token });
-    const nonce = (await this.post("/mint/v1/nonce", { ses })).json.nonce;
+    if (!this.att) await this.prewarm({ ses, fph: opts.fph, token: opts.token }, signal);
+    const nonce = (await this.post("/mint/v1/nonce", { ses }, signal)).json.nonce;
     const t = Math.floor(Date.now() / 1000);
     const hs = await this.handshake(this.att!, opts.entitlement, nonce, t);
-    const r = await this.post("/mint/v1", { assetId: opts.assetId, att: this.att, entitlement: opts.entitlement, nonce, handshake: hs, t });
+    const r = await this.post("/mint/v1", { assetId: opts.assetId, att: this.att, entitlement: opts.entitlement, nonce, handshake: hs, t }, signal);
     if (r.status !== 200) throw new Error("mint failed: " + r.status + " " + JSON.stringify(r.json));
     return r.json as Grant;
   }
 
   /** Fetch the att-gated content key (AES-128, 16 bytes). */
-  async contentKey(assetId: string): Promise<Uint8Array> {
-    const r = await this.f(`${this.cfg.mint}/key/v1/${assetId}?att=${this.att}`, { headers: this.hdr() });
+  async contentKey(assetId: string, signal?: AbortSignal): Promise<Uint8Array> {
+    const r = await this.f(`${this.cfg.mint}/key/v1/${assetId}?att=${this.att}`, { headers: this.hdr(), signal });
     if (r.status !== 200) throw new Error("key fetch failed: " + r.status);
     return unb64u((await r.json()).key);
   }
@@ -298,8 +403,16 @@ export class TegisPlayer {
     }
     return Math.min(jit.baseDelayMs * 2 ** (attempt - 1), jit.maxDelayMs);
   }
-  private sleep(ms: number): Promise<void> {
-    return this.cfg.delayFn ? this.cfg.delayFn(ms) : new Promise((res) => setTimeout(res, ms));
+  private sleep(ms: number, signal?: AbortSignal): Promise<void> {
+    if (this.cfg.delayFn) return this.cfg.delayFn(ms);
+    return new Promise((res, rej) => {
+      if (signal?.aborted) return rej(abortError());
+      const t = setTimeout(res, ms);
+      signal?.addEventListener("abort", () => {
+        clearTimeout(t);
+        rej(abortError());
+      }, { once: true });
+    });
   }
   private emitState(s: PlayerState): void {
     try {
@@ -315,12 +428,12 @@ export class TegisPlayer {
    * and a `ready` state once the bytes arrive. Exhausted retries throw a graceful terminal error (flagged
    * `preparing`); a genuine non-2xx throws immediately.
    */
-  async fetchBytes(url: string): Promise<Uint8Array> {
+  async fetchBytes(url: string, signal?: AbortSignal): Promise<Uint8Array> {
     const full = url.startsWith("http") ? url : this.cfg.edge + url;
     const jit = this.jitOpts();
     let attempt = 0;
     for (;;) {
-      const r = await this.f(full, { headers: this.hdr() });
+      const r = await this.f(full, { headers: this.hdr(), signal });
       if (r.status === 200) {
         if (attempt > 0) this.emitState({ state: "ready", url: full, attempts: attempt });
         return new Uint8Array(await r.arrayBuffer());
@@ -332,7 +445,7 @@ export class TegisPlayer {
         this.qoe.addPreparing(retryAfterMs); // QoE: count this preparing occurrence + the ms it will wait
         this.emitState({ state: "preparing", url: full, attempt, maxAttempts: jit.maxAttempts, retryAfterMs });
         this.beacon("preparing", "jit"); // e2e funnel: cold segment still preparing (best-effort)
-        await this.sleep(retryAfterMs);
+        await this.sleep(retryAfterMs, signal);
         continue;
       }
       if (preparing) {
@@ -346,205 +459,312 @@ export class TegisPlayer {
     }
   }
   /** The headless-verifiable core: fetch a media segment from the edge/CDN + decrypt it with WebCrypto. */
-  async decryptedSegment(assetId: string, url: string, key?: Uint8Array): Promise<Uint8Array> {
-    const k = key ?? (await this.contentKey(assetId));
-    return decryptSegment(k, await this.fetchBytes(url));
+  async decryptedSegment(assetId: string, url: string, key?: Uint8Array, signal?: AbortSignal): Promise<Uint8Array> {
+    const k = key ?? (await this.contentKey(assetId, signal));
+    return decryptSegment(k, await this.fetchBytes(url, signal));
   }
 
   /** Steady-state renewal: report realtime progress to receive the next signed window. */
-  async renew(playbackId: string, hbKeyB64u: string, progress: { pos: number; seq: number }): Promise<{ manifest: string[]; window: { from: number; to: number } }> {
+  async renew(
+    playbackId: string,
+    hbKeyB64u: string,
+    progress: { pos: number; seq: number },
+    signal?: AbortSignal,
+  ): Promise<{ manifest: string[]; window: { from: number; to: number } }> {
     const hb = { pbk: playbackId, pos: progress.pos, seq: progress.seq, state: "playing", iat: Math.floor(Date.now() / 1000) };
     const sig = await hbSign(hbKeyB64u, JSON.stringify(hb));
-    const r = await this.post("/mint/v1/renew", { playbackId, heartbeat: hb, sig });
+    const r = await this.post("/mint/v1/renew", { playbackId, heartbeat: hb, sig }, signal);
     if (r.status !== 200) throw new Error("renew failed: " + r.status);
     return r.json;
   }
 
-  /** Decrypt + append each segment URL of one window, in order, serialized through the SourceBuffer. Returns
-   *  true when the stream reached its TRUE end — a segment fetch that fails (a 404 past the sealed content, or
-   *  a `preparing` retry budget exhausted) — so the caller stops renewing. `markFirst` fires the one-time
-   *  first-segment funnel beacon. Browser-only glue (the append closure drives MSE); the fetch/decrypt core is
-   *  the shared, headless-verifiable path. */
-  private async appendSegments(
-    assetId: string,
-    urls: string[],
-    key: Uint8Array,
-    append: (buf: Uint8Array) => Promise<void>,
-    markFirst: () => void,
-  ): Promise<boolean> {
-    for (const url of urls) {
-      let seg: Uint8Array;
-      try {
-        seg = await this.decryptedSegment(assetId, url, key); // 404 ⇒ past the end of the packaged content
-      } catch {
-        return true; // past the end, or unfetchable after the JIT backoff — stop the stream here
-      }
-      markFirst();
-      await append(seg);
+  /** Seconds of contiguous buffered media ahead of the playhead (0 if the playhead isn't inside a range).
+   *  The back-pressure signal for the feed loop and the "buffer present but stuck" input to the stall watchdog. */
+  private bufferedAhead(video: HTMLVideoElement): number {
+    const b = video.buffered;
+    const t = video.currentTime;
+    for (let i = 0; i < b.length; i++) {
+      if (b.start(i) <= t + 0.25 && t <= b.end(i) + 0.25) return b.end(i) - t;
     }
-    return false; // whole window appended; more windows may follow
+    return 0;
   }
 
-  /** Resolve `true` when the forward buffer has drained below the low-water mark (time to renew the next
-   *  window) or `false` when playback ended / the MediaSource closed (stop the pump). Driven by `timeupdate`
-   *  (≈4×/s while playing) plus a 1s interval to cover the paused/stalled case — so it costs nothing while
-   *  idle and reacts to REAL playback progress, which keeps the renew pace honest (a paused player never
-   *  prefetches ahead). Browser-only. */
-  private awaitDrain(video: HTMLVideoElement, ms: MediaSource): Promise<boolean> {
-    const LOW_WATER_S = 8; // renew when < 8s of forward buffer remains (a window is ~30s → ample lead)
-    const aheadOfPlayhead = (): number => {
-      const b = video.buffered;
-      for (let i = 0; i < b.length; i++) {
-        if (b.start(i) <= video.currentTime + 0.25 && video.currentTime <= b.end(i) + 0.25) {
-          return b.end(i) - video.currentTime;
-        }
-      }
-      return 0;
+  /** Resolve on the next real playback progress (`timeupdate`), end, error, abort, or a 500ms fallback tick —
+   *  so the feed loop's back-pressure wait reacts to the playhead draining the buffer, costs nothing while
+   *  idle, and never wedges (the fallback covers a paused/stalled element). Browser-only. */
+  private waitTick(video: HTMLVideoElement, signal: AbortSignal): Promise<void> {
+    return new Promise((res) => {
+      if (signal.aborted || typeof video.addEventListener !== "function") return res();
+      let done = false;
+      const fin = () => {
+        if (done) return;
+        done = true;
+        clearTimeout(t);
+        video.removeEventListener("timeupdate", fin);
+        video.removeEventListener("ended", fin);
+        video.removeEventListener("error", fin);
+        signal.removeEventListener("abort", fin);
+        res();
+      };
+      const t = setTimeout(fin, 500);
+      video.addEventListener("timeupdate", fin);
+      video.addEventListener("ended", fin);
+      video.addEventListener("error", fin);
+      signal.addEventListener("abort", fin, { once: true });
+    });
+  }
+
+  /** Never-hang watchdogs (browser-only), armed after the first segment is appended + play() is called:
+   *  (1) first-frame — no `playing` within FIRST_FRAME_TIMEOUT_MS ⇒ `no_first_frame`; (2) stall — `currentTime`
+   *  frozen for STALL_MS while playing WITH buffered data ahead (a genuine stuck, not a normal underrun the
+   *  feed loop will refill) ⇒ `stalled`. Both surface via `onError` (legible), never tear down. Registers its
+   *  cleanup into `cleanups`. */
+  private armWatchdogs(video: HTMLVideoElement, signal: AbortSignal, onError: (e: PlayError) => void, cleanups: Array<() => void>): void {
+    if (typeof video.addEventListener !== "function") return;
+    let gotFrame = false;
+    const onPlaying = () => {
+      gotFrame = true;
     };
-    return new Promise<boolean>((resolve) => {
-      let settled = false;
-      const settle = (v: boolean) => {
-        if (settled) return;
-        settled = true;
-        video.removeEventListener("timeupdate", check);
-        video.removeEventListener("ended", stop);
-        video.removeEventListener("error", stop);
-        clearInterval(iv);
-        resolve(v);
-      };
-      const check = () => {
-        if (video.ended || ms.readyState !== "open") return settle(false);
-        if (aheadOfPlayhead() < LOW_WATER_S) return settle(true);
-      };
-      const stop = () => settle(false);
-      video.addEventListener("timeupdate", check);
-      video.addEventListener("ended", stop);
-      video.addEventListener("error", stop);
-      const iv = setInterval(check, 1000);
-      check(); // the buffer may already be low (e.g. a very short first window)
+    video.addEventListener("playing", onPlaying, { once: true });
+    const ffTimer = setTimeout(() => {
+      if (!gotFrame && !signal.aborted && !video.paused) {
+        onError({
+          code: "no_first_frame",
+          message: `no first frame after ${FIRST_FRAME_TIMEOUT_MS}ms — buffered ${this.bufferedAhead(video).toFixed(1)}s ahead, readyState ${video.readyState}`,
+        });
+      }
+    }, FIRST_FRAME_TIMEOUT_MS);
+    let last = -1;
+    let lastAt = Date.now();
+    const stallIv = setInterval(() => {
+      if (signal.aborted) return;
+      const t = video.currentTime;
+      if (video.paused || video.ended || t !== last) {
+        last = t;
+        lastAt = Date.now();
+        return;
+      }
+      if (Date.now() - lastAt >= STALL_MS && this.bufferedAhead(video) > 0.5) {
+        onError({
+          code: "stalled",
+          message: `currentTime stuck at ${t.toFixed(2)}s for ${STALL_MS}ms with ${this.bufferedAhead(video).toFixed(1)}s buffered ahead`,
+        });
+        lastAt = Date.now(); // rearm — don't spam
+      }
+    }, 1000);
+    cleanups.push(() => {
+      clearTimeout(ffTimer);
+      clearInterval(stallIv);
+      video.removeEventListener("playing", onPlaying);
     });
   }
 
   /**
-   * Full browser playback via MSE (browser-only): mint → append the init segment → fetch+decrypt+append the
-   * first grant window → play → then a playback-paced renewal pump continues window-by-window past the first
-   * (see {@link pumpWindows}) until the asset's true end. The att-gated key is fetched once. Returns the grant
-   * as soon as the first window is playing (the pump runs detached) — so TTFF and the return contract are
-   * unchanged from the single-window player.
+   * Own progressive streaming end-to-end (browser-only). mint → derive the codec from the init → append init +
+   * first segment (fast first frame) → play → then a PACED feed loop streams the rest: it prefetches to keep
+   * ~HIGH_WATER_S buffered ahead of the playhead (back-pressure), crosses mint-window boundaries seamlessly
+   * (renews before the current window drains), and stops at the first phantom/past-end segment — calling
+   * `endOfStream()` only after the final segment of the final window. Returns a {@link PlaybackHandle} (a
+   * superset of the grant) as soon as the first frame is ready; the feed loop runs detached. `handle.stop()`
+   * (or an aborted `opts.signal`) tears everything down: pause, detach the MediaSource, cancel all in-flight
+   * fetch/decrypt/append. Every failure path surfaces a legible {@link PlayError} via `onError` + console
+   * instead of a silent hang.
    */
-  async play(video: HTMLVideoElement, opts: { assetId: string; entitlement: string; ses?: string; fph?: string; mime?: string; token?: string }): Promise<Grant> {
-    // Fail fast with a clear message if the caller passed no element — otherwise the first thing we do
-    // (wireFunnel's video.addEventListener) throws the cryptic "Cannot read properties of null (reading
-    // 'addEventListener')". The element must exist before play() (e.g. a caller whose <video> mounts async
-    // must await it — see the demo player-dialog).
+  async play(video: HTMLVideoElement, opts: PlayOpts): Promise<PlaybackHandle> {
     if (!video) throw new Error("play: a video element is required");
-    if (typeof MediaSource === "undefined") throw new Error("MSE unavailable in this environment");
-    // Client funnel: tag every step with a stable ses (reused by mint), wire the video listeners, and
-    // emit play_requested at the click. All beacons are best-effort and never affect playback.
+    if (typeof MediaSource === "undefined" && typeof (globalThis as { ManagedMediaSource?: unknown }).ManagedMediaSource === "undefined") {
+      throw new Error("play: MSE unavailable in this environment");
+    }
+
+    // Teardown scaffolding: one AbortController drives cancellation of all in-flight work; `cleanups` unwinds
+    // listeners/timers; `teardown` is idempotent and detaches the element.
+    const ac = new AbortController();
+    const signal = ac.signal;
+    const cleanups: Array<() => void> = [];
+    let stopped = false;
+    let ms: MediaSource | undefined;
+    const onError = (e: PlayError): void => {
+      try {
+        console.error(`[tegis/player] ${e.code}: ${e.message}`, e.cause ?? "");
+      } catch {
+        /* console may be absent */
+      }
+      try {
+        opts.onError?.(e);
+      } catch {
+        /* a host callback must never break playback */
+      }
+    };
+    const teardown = async (): Promise<void> => {
+      if (stopped) return;
+      stopped = true;
+      ac.abort();
+      for (const c of cleanups.splice(0)) {
+        try {
+          c();
+        } catch {
+          /* best-effort */
+        }
+      }
+      try {
+        video.pause();
+      } catch {
+        /* detached/gone */
+      }
+      try {
+        (video as unknown as { srcObject: unknown }).srcObject = null; // detach an srcObject handle
+      } catch {
+        /* not srcObject */
+      }
+      try {
+        const u = video.src;
+        if (u) {
+          video.removeAttribute("src");
+          if (u.startsWith("blob:")) URL.revokeObjectURL(u); // detach + free an object URL
+        }
+      } catch {
+        /* best-effort */
+      }
+      try {
+        video.load();
+      } catch {
+        /* best-effort */
+      }
+      this.emitQoe();
+    };
+    if (opts.signal) {
+      if (opts.signal.aborted) ac.abort();
+      else opts.signal.addEventListener("abort", () => void teardown(), { once: true });
+    }
+
+    // Client funnel + element setup.
     const ses = this.attSes ?? opts.ses ?? "ses_" + randHex(4);
     this.evtSes = ses;
     this.evtAst = opts.assetId;
     this.evtPbk = undefined;
     this.watched.clear();
-    this.qoe.reset(); // fresh QoE accounting for this playback
+    this.qoe.reset();
     this.qoeSent = false;
+    if (opts.loop) video.loop = true;
+    if (opts.muted) video.muted = true;
+    if (opts.playsInline !== false) {
+      video.playsInline = true;
+      try {
+        video.setAttribute("playsinline", ""); // iOS honors the attribute
+      } catch {
+        /* non-DOM stub */
+      }
+    }
     this.wireFunnel(video);
     this.wireUnloadQoe();
-    this.qoe.markPlayRequested(); // opens the TTFF span at the click, alongside the play_requested beacon
+    this.qoe.markPlayRequested();
     this.beacon("play_requested");
+
     try {
-      const g = await this.mint({ ...opts, ses });
-      this.evtSes = this.attSes ?? ses; // the ses the mint actually used
+      throwIfAborted(signal);
+      const g = await this.mint({ ...opts, ses }, signal);
+      this.evtSes = this.attSes ?? ses;
       this.evtPbk = g.playbackId;
       this.beacon("granted");
-      const key = await this.contentKey(opts.assetId);
-      const ms = createMediaSource();
+      const key = await this.contentKey(opts.assetId, signal);
+      throwIfAborted(signal);
+
+      ms = createMediaSource();
       attachMediaSource(video, ms);
-      await new Promise<void>((res) => ms.addEventListener("sourceopen", () => res(), { once: true }));
-      // Derive the SourceBuffer codec from the init segment's `moov` (its real avcC/esds) instead of a
-      // hardcoded guess: a wrong `codecs=` — e.g. Main@L3 declared for 1080p High, or a phantom audio codec
-      // on a video-only asset — lets the browser ACCEPT the append but silently fail to decode (frozen frame,
-      // nothing thrown). An explicit opts.mime still wins; codecsFromInit is the derive; DEFAULT_MIME is the
-      // last resort; isTypeSupported turns an undecodable codec into a clear throw rather than a hang.
-      const initBytes = await this.fetchBytes(g.init); // init segment (unencrypted codec config)
+      await onceEvent(ms, "sourceopen", signal);
+
+      // Derive the codec from the init `moov` (video-only H.264 High); gate on isTypeSupported.
+      const initBytes = await this.fetchBytes(g.init, signal);
       const mime = opts.mime ?? codecsFromInit(initBytes) ?? DEFAULT_MIME;
       if (!msTypeSupported(ms, mime)) {
-        throw new Error(`play: this browser can't decode the content codec (${mime}) — isTypeSupported === false`);
+        const e: PlayError = { code: "codec_unsupported", message: `this browser can't decode the content codec (${mime})` };
+        onError(e);
+        throw new Error(e.message);
       }
       const sb = ms.addSourceBuffer(mime);
-      const append = (buf: Uint8Array) =>
-        new Promise<void>((res, rej) => {
-          const onEnd = () => {
+      try {
+        sb.mode = "segments"; // CMAF bare fragments: chained baseMediaDecodeTime timing; overlap = last-write-wins
+      } catch {
+        /* segments is the default anyway */
+      }
+
+      // Serialized, abortable append — resolves on updateend; rejects on the SourceBuffer error event, a
+      // synchronous appendBuffer throw, or abort.
+      const append = (buf: Uint8Array): Promise<void> =>
+        new Promise((res, rej) => {
+          if (signal.aborted) return rej(abortError());
+          const off = () => {
+            sb.removeEventListener("updateend", onEnd);
             sb.removeEventListener("error", onErr);
+            signal.removeEventListener("abort", onAbort);
+          };
+          const onEnd = () => {
+            off();
             res();
           };
           const onErr = () => {
-            sb.removeEventListener("updateend", onEnd);
-            rej(new Error(`play: SourceBuffer append failed (codec "${mime}")`));
+            off();
+            rej(new Error(`SourceBuffer append failed (codec "${mime}")`));
+          };
+          const onAbort = () => {
+            off();
+            rej(abortError());
           };
           sb.addEventListener("updateend", onEnd, { once: true });
           sb.addEventListener("error", onErr, { once: true });
+          signal.addEventListener("abort", onAbort, { once: true });
           try {
             sb.appendBuffer(buf as BufferSource);
           } catch (e) {
-            // A synchronous QuotaExceeded / InvalidState throw must reject — not escape as an unhandled error.
-            sb.removeEventListener("updateend", onEnd);
-            sb.removeEventListener("error", onErr);
-            rej(e);
+            off();
+            rej(e); // synchronous QuotaExceeded / InvalidState → reject, never an unhandled throw
           }
         });
-      // A decode/format failure surfaces as a MediaError on the <video> element — NOT the SourceBuffer's
-      // `error` event — so without this the first frame just freezes with nothing thrown. Race it against the
-      // initial (decode-sensitive) appends so a mismatch throws a legible reason; the renewal pump's
-      // awaitDrain owns errors for later windows, so the guard is scoped to init and torn down right after.
-      let mediaErrHandler: (() => void) | undefined;
-      const mediaError = new Promise<never>((_res, rej) => {
-        mediaErrHandler = () => {
-          const e = video.error;
-          rej(
-            new Error(
-              `play: MSE playback error${e ? ` (MediaError ${e.code}${e.message ? ": " + e.message : ""})` : ""}` +
-                ` — appended media failed to decode; SourceBuffer codec "${mime}" may not match the content`,
-            ),
-          );
-        };
-        video.addEventListener("error", mediaErrHandler);
-      });
-      mediaError.catch(() => {}); // a late fire (during the detached pump) must never be an unhandled rejection
-      let firstSeg = true;
-      const markFirst = () => {
-        if (firstSeg) {
-          firstSeg = false;
+
+      // A decode/format failure surfaces as a MediaError on the <video>, NOT the SourceBuffer error event —
+      // wire it for the whole playback so a mismatch is legible instead of a silent frozen frame.
+      const onMediaError = () => {
+        const err = video.error;
+        onError({
+          code: "decode",
+          message: `MediaError ${err?.code ?? "?"}${err?.message ? ": " + err.message : ""} — codec "${mime}" may not match the content`,
+          cause: err,
+        });
+      };
+      video.addEventListener("error", onMediaError);
+      cleanups.push(() => video.removeEventListener("error", onMediaError));
+
+      // Init + first segment → play immediately (fast first frame).
+      await append(initBytes);
+      const manifest = g.manifest ?? [];
+      let firstReachedEnd = manifest.length === 0;
+      if (manifest.length > 0) {
+        try {
+          const first = await this.decryptedSegment(opts.assetId, manifest[0], key, signal);
           this.beacon("first_segment_decrypted");
+          await append(first);
+        } catch (e) {
+          if (isAbort(e)) throw e;
+          firstReachedEnd = classifyFetchError(e) === "end"; // an all-phantom grant → nothing to play
+          if (!firstReachedEnd) onError({ code: "segment_fetch", message: `first segment failed: ${(e as Error).message}`, cause: e });
         }
-      };
-      // Window 1 — the first grant window (the lead buffer). `reachedEnd` is true when this window already ran
-      // off the end of the packaged content (a segment 404): a SHORT asset that fits one grant window.
-      let reachedEnd: boolean;
-      try {
-        await Promise.race([append(initBytes), mediaError]);
-        reachedEnd = await Promise.race([
-          this.appendSegments(opts.assetId, g.manifest, key, append, markFirst),
-          mediaError,
-        ]);
-      } finally {
-        if (mediaErrHandler) video.removeEventListener("error", mediaErrHandler);
       }
+      throwIfAborted(signal);
 
-      const endStream = () => {
-        if (ms.readyState === "open") {
+      if (opts.onFirstFrame) {
+        const ff = () => {
           try {
-            ms.endOfStream();
+            opts.onFirstFrame!();
           } catch {
-            /* already ended/closed */
+            /* host callback */
           }
-        }
-      };
+        };
+        video.addEventListener("playing", ff, { once: true });
+        cleanups.push(() => video.removeEventListener("playing", ff));
+      }
+      this.armWatchdogs(video, signal, onError, cleanups);
 
-      // Best-effort autoplay. Browsers block autoplay-with-audio when media engagement is low (e.g. an
-      // incognito session, MEI=0). Muted autoplay is always permitted, so on a block fall back to muted
-      // rather than leaving a frozen first frame; if it is still blocked, the element stays paused for the
-      // caller's play control. Report the outcome so the caller can surface an unmute/play affordance.
+      // Best-effort autoplay; fall back to muted where autoplay-with-audio is blocked.
       let autoplay: NonNullable<Grant["autoplay"]> = "playing";
       try {
         await video.play();
@@ -559,29 +779,49 @@ export class TegisPlayer {
       }
       g.autoplay = autoplay;
 
-      // Beyond one grant window (an asset LONGER than the tenant's segment TTL, ~30s): drive the renewal pump
-      // so playback continues past the first window instead of ending at it. PLAYBACK-PACED — it renews as the
-      // buffer drains, reporting the real currentTime, so the mint's realtime pace guard is always satisfied —
-      // and DETACHED, so play() still resolves at first-frame readiness (contract + TTFF unchanged). A short
-      // asset already reached its end above → just close the stream now. Best-effort: a pump failure ends the
-      // stream at whatever is buffered and never rejects the caller.
-      if (reachedEnd) {
-        endStream();
+      const endStream = () => {
+        try {
+          if (ms && ms.readyState === "open") ms.endOfStream();
+        } catch {
+          /* already ended/closed */
+        }
+      };
+
+      const handle: PlaybackHandle = Object.assign({}, g, { stop: teardown });
+
+      if (firstReachedEnd) {
+        endStream(); // the first segment was the whole clip (or an empty grant)
       } else {
-        void pumpWindows({
+        // The paced feed loop streams the rest across window boundaries, detached — play() returns at first frame.
+        void feedStream({
+          segments: manifest.slice(1),
           windowTo: g.window.to,
-          reachedEnd,
-          renew: (pos, seq) => this.renew(g.playbackId, g.hbKeyB64u, { pos, seq }),
-          appendWindow: (urls) => this.appendSegments(opts.assetId, urls, key, append, markFirst),
-          awaitDrain: () => this.awaitDrain(video, ms),
+          highWaterS: HIGH_WATER_S,
+          aborted: () => signal.aborted,
+          isEnded: () => video.ended,
+          bufferedAhead: () => this.bufferedAhead(video),
+          waitTick: () => this.waitTick(video, signal),
+          fetchSegment: (url) => this.decryptedSegment(opts.assetId, url, key, signal),
+          append,
+          renew: (pos, seq) => this.renew(g.playbackId, g.hbKeyB64u, { pos, seq }, signal),
           pos: () => video.currentTime,
-        }).then(endStream, endStream);
+          endStream,
+          classifyError: classifyFetchError,
+          onEnd: (reason, detail) => {
+            if (reason === "error") onError({ code: "segment_fetch", message: "playback stream ended on error", cause: detail });
+          },
+        });
       }
-      return g;
+
+      return handle;
     } catch (e) {
-      // The playback pipeline failed client-side (mint/key/decrypt/MSE). Record where, for the trace.
+      if (isAbort(e)) {
+        await teardown();
+        throw abortError();
+      }
       this.beacon("error", e instanceof Error ? e.message.slice(0, 80) : "play_failed");
-      this.emitQoe(); // terminal: flush QoE for a client-side playback failure too
+      onError({ code: "play_failed", message: e instanceof Error ? e.message : "play failed", cause: e });
+      this.emitQoe();
       throw e;
     }
   }
@@ -784,49 +1024,94 @@ export interface Window {
   window: { from: number; to: number };
 }
 
-/** Collaborators for {@link pumpWindows} — injected so the loop is unit-testable with fakes (no MSE, no real
- *  timers): `renew` fetches the next signed window, `appendWindow` decrypts+appends it (returning the true-end
- *  flag), `awaitDrain` gates the next renew on playback draining the buffer, and `pos` reads the real position
- *  reported to the mint's pace guard. */
-export interface PumpOpts {
-  /** The last segment index of the window already appended (window 1's `window.to`). */
+/** Collaborators for {@link feedStream} — injected so the paced feed loop is unit-testable with fakes (no MSE,
+ *  no real timers). The class wires the real implementations in `play()`. */
+export interface FeedOpts {
+  /** Remaining segment URLs of the CURRENT (first) window — the first segment is appended by play() already. */
+  segments: string[];
+  /** Last segment index of the current window (its `window.to`) — reported as `seq` to the mint on renew. */
   windowTo: number;
-  /** True if the already-appended window ran off the end (short asset) — then the pump is a no-op. */
-  reachedEnd: boolean;
-  renew: (pos: number, seq: number) => Promise<Window>;
-  /** Append a window's segments; returns true when the stream reached its true end. */
-  appendWindow: (urls: string[]) => Promise<boolean>;
-  /** Resolve true when it is time to renew (buffer drained), false to stop the pump (playback ended). */
-  awaitDrain: () => Promise<boolean>;
-  /** Current playback position (seconds) reported to the pace guard — MUST be the real playhead, never ahead. */
+  /** Stop fetching once this many seconds are buffered ahead of the playhead (back-pressure). */
+  highWaterS: number;
+  aborted: () => boolean;
+  isEnded: () => boolean;
+  /** Seconds buffered ahead of the playhead — the back-pressure signal. */
+  bufferedAhead: () => number;
+  /** Resolve on the next playback tick (drain), end, error, abort, or a fallback timeout. */
+  waitTick: () => Promise<void>;
+  /** Fetch + decrypt one media segment; throws 404-past-end / phantom `preparing` at the true end. */
+  fetchSegment: (url: string) => Promise<Uint8Array>;
+  append: (buf: Uint8Array) => Promise<void>;
+  renew: (pos: number, windowTo: number) => Promise<Window>;
+  /** Current playback position (seconds) reported to the pace guard — the REAL playhead, never ahead. */
   pos: () => number;
+  /** Seal the MediaSource (called only after the final segment of the final window). */
+  endStream: () => void;
+  /** Classify a failed `fetchSegment`: `"end"` (404-past-end / phantom) stops silently; `"error"` surfaces. */
+  classifyError: (e: unknown) => "end" | "error";
+  onEnd?: (reason: "complete" | "aborted" | "error", detail?: unknown) => void;
 }
 
 /**
- * Playback-paced renewal pump. Renews the grant window-by-window and appends each, waiting for the buffer to
- * drain between windows, until the asset's true end (a segment 404 → `appendWindow` returns true, or the mint
- * returns an empty window) or a stop (`awaitDrain` returns false / a renew failure). Extracted and exported so
- * the loop is unit-testable with fakes — no MSE, no real timers.
- *
- * Pacing: `seq` is reported as the last-appended segment index (so it strictly advances each renew, satisfying
- * the mint's replay guard), and `pos` is the REAL playhead — so `pos ≤ elapsed×1.25 + 5s` always holds for
- * ≈1× playback and the mint never paces the honest pump out. It NEVER prefetches ahead of playback (a renew
- * only fires once `awaitDrain` reports the buffer low), which is what keeps it honest. A renew rejection
- * (expired grant, paced-out at high playback rates, network) ends the pump gracefully at the buffered content.
+ * The paced, multi-window feed loop (browser-free core, exported for unit tests). It streams segments while
+ * keeping at most `highWaterS` seconds buffered ahead of the playhead — fetching more only as playback drains
+ * (back-pressure), so it never over-fetches nor underruns — and crosses grant-window boundaries seamlessly:
+ * when the current window's segments are consumed it RENEWS the next window before the buffer empties (the
+ * prefetch lead), reporting the real floored `pos` and last-appended `seq` so the mint's pace/replay guards
+ * are always satisfied. It stops — sealing via `endStream()` — at the true end: the first segment that won't
+ * produce (404 past the sealed content, or a phantom trailing segment whose JIT `preparing` budget is spent),
+ * a renew that rejects (expired/paced-out/network), or a renew that returns an empty window. Abort stops it
+ * immediately, leaving whatever is buffered.
  */
-export async function pumpWindows(opts: PumpOpts): Promise<void> {
-  let windowTo = opts.windowTo;
-  let reachedEnd = opts.reachedEnd;
-  while (!reachedEnd) {
-    if (!(await opts.awaitDrain())) return; // playback ended / element gone — stop, leave the stream as-is
-    let next: Window;
-    try {
-      next = await opts.renew(Math.floor(opts.pos()), windowTo);
-    } catch {
-      return; // grant expired / paced-out / network — end gracefully with what is buffered
+export async function feedStream(o: FeedOpts): Promise<void> {
+  let segments = o.segments;
+  let windowTo = o.windowTo;
+  try {
+    while (!o.aborted()) {
+      if (segments.length === 0) {
+        let next: Window;
+        try {
+          next = await o.renew(Math.floor(o.pos()), windowTo);
+        } catch {
+          break; // grant expired / paced-out / network — end gracefully with what is buffered
+        }
+        if (!next.manifest || next.manifest.length === 0) break; // mint's true-end signal
+        segments = next.manifest;
+        windowTo = next.window.to;
+        continue;
+      }
+      // Back-pressure: hold once ~highWaterS seconds are buffered ahead; resume as the playhead drains it.
+      while (!o.aborted() && !o.isEnded() && o.bufferedAhead() >= o.highWaterS) {
+        await o.waitTick();
+      }
+      if (o.aborted() || o.isEnded()) break;
+      let seg: Uint8Array;
+      try {
+        seg = await o.fetchSegment(segments[0]);
+      } catch (e) {
+        if (o.aborted()) break;
+        if (o.classifyError(e) === "error") {
+          o.onEnd?.("error", e);
+          return;
+        }
+        break; // 404 past-end / phantom trailing segment → the stream's true end
+      }
+      segments = segments.slice(1);
+      try {
+        await o.append(seg);
+      } catch (e) {
+        if (o.aborted()) break;
+        o.onEnd?.("error", e);
+        return;
+      }
     }
-    if (!next.manifest || next.manifest.length === 0) return; // mint signalled no further window → true end
-    windowTo = next.window.to;
-    reachedEnd = await opts.appendWindow(next.manifest);
+    if (o.aborted()) {
+      o.onEnd?.("aborted");
+    } else {
+      o.endStream();
+      o.onEnd?.("complete");
+    }
+  } catch (e) {
+    if (!o.aborted()) o.onEnd?.("error", e);
   }
 }
