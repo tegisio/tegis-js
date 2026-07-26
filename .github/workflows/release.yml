@@ -106,7 +106,11 @@ jobs:
                   else v=MA+"."+MI+"."+PA+"-"+pre+".0"; }
                 else v=MA+"."+MI+"."+(PA+1)+"-"+preid+".0";
               } else v=cur; // none
-              if(v!==cur) fs.writeFileSync(p, txt.replace(/("version"\s*:\s*")[^"]+(")/, "$1"+v+"$2"));
+              if(v!==cur){
+                fs.writeFileSync(p, txt.replace(/("version"\s*:\s*")[^"]+(")/, "$1"+v+"$2"));
+                const ip="./src/index.ts";                        // keep the exported VERSION const in sync
+                if(fs.existsSync(ip)){ const it=fs.readFileSync(ip,"utf8"); const nt=it.replace(/(export const VERSION\s*=\s*")[^"]*(")/, "$1"+v+"$2"); if(nt!==it) fs.writeFileSync(ip,nt); }
+              }
               process.stdout.write(v);
             ')"
 
@@ -147,12 +151,13 @@ jobs:
 
             if (process.env.BUMP !== "none") {
               const base = await github.rest.git.getCommit({ owner, repo, commit_sha: sha });
-              const tree = pkgs.map((p) => ({
-                path: `packages/${p}/package.json`,
-                mode: "100644",
-                type: "blob",
-                content: fs.readFileSync(`packages/${p}/package.json`, "utf8"),
-              }));
+              const tree = [];
+              for (const p of pkgs) {
+                for (const rel of ["package.json", "src/index.ts"]) {
+                  const fp = `packages/${p}/${rel}`;
+                  if (fs.existsSync(fp)) tree.push({ path: fp, mode: "100644", type: "blob", content: fs.readFileSync(fp, "utf8") });
+                }
+              }
               const newTree = await github.rest.git.createTree({ owner, repo, base_tree: base.data.tree.sha, tree });
               const commit = await github.rest.git.createCommit({
                 owner, repo,
