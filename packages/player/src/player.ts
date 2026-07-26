@@ -458,8 +458,8 @@ export class TegisPlayer {
       this.evtPbk = g.playbackId;
       this.beacon("granted");
       const key = await this.contentKey(opts.assetId);
-      const ms = new MediaSource();
-      video.src = URL.createObjectURL(ms);
+      const ms = createMediaSource();
+      attachMediaSource(video, ms);
       await new Promise<void>((res) => ms.addEventListener("sourceopen", () => res(), { once: true }));
       const mime = opts.mime ?? 'video/mp4; codecs="avc1.4d401e, mp4a.40.2"';
       const sb = ms.addSourceBuffer(mime);
@@ -535,6 +535,38 @@ export class TegisPlayer {
       throw e;
     }
   }
+}
+
+// ---- MSE attachment (browser) ---------------------------------------------------------------------------
+// Newer/non-standard MSE surface not always in the TS DOM lib: ManagedMediaSource (iOS Safari; plain
+// MediaSource is unsupported there) and the MediaSourceHandle exposed as `MediaSource.prototype.handle`,
+// attached via `video.srcObject`. Declared loosely so the player builds against any lib.dom version.
+type MediaSourceLike = MediaSource & { handle?: unknown };
+
+/** Create the playback MediaSource, preferring ManagedMediaSource where present (required on iOS Safari,
+ *  where plain MediaSource is unavailable) and falling back to the standard MediaSource. Same API surface
+ *  either way (addSourceBuffer / endOfStream), so the rest of play() is unchanged. */
+export function createMediaSource(): MediaSource {
+  const MMS = (globalThis as unknown as { ManagedMediaSource?: typeof MediaSource }).ManagedMediaSource;
+  const Ctor = MMS ?? MediaSource;
+  return new Ctor();
+}
+
+/** Attach a MediaSource to a video element, preferring the modern MediaSourceHandle + `srcObject` — the path
+ *  that survives Chrome's removal of `URL.createObjectURL(MediaSource)` and is REQUIRED for ManagedMediaSource
+ *  (iOS) — and falling back to the object URL only where a handle isn't available. Returns the method used. */
+export function attachMediaSource(video: HTMLVideoElement, ms: MediaSource): "srcObject" | "objectURL" {
+  const handle = (ms as MediaSourceLike).handle;
+  if (handle != null && "srcObject" in video) {
+    // srcObject/disableRemotePlayback typed loosely (via unknown) so the assignment builds against any
+    // lib.dom version. ManagedMediaSource requires remote playback disabled; a no-op for a plain handle.
+    const v = video as unknown as { srcObject: unknown; disableRemotePlayback?: boolean };
+    v.disableRemotePlayback = true;
+    v.srcObject = handle;
+    return "srcObject";
+  }
+  video.src = URL.createObjectURL(ms);
+  return "objectURL";
 }
 
 /** A signed playback window returned by mint `/mint/v1` (grant) or `/mint/v1/renew`: the media-segment URLs
