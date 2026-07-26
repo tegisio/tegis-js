@@ -87,12 +87,28 @@ jobs:
 
             bun test                                   # quality gate — a red suite blocks the publish
 
-            if [ "$BUMP" = "prerelease" ]; then
-              npm version prerelease --preid="$TAG" --no-git-tag-version >/dev/null
-            elif [ "$BUMP" != "none" ]; then
-              npm version "$BUMP" --no-git-tag-version >/dev/null
-            fi                                           # none = publish package.json as-is
-            ver="$(node -p 'require("./package.json").version')"
+            # Bump the version with a plain node edit (touches only the `version` string). Deliberately NOT
+            # `npm version`: this is a bun workspace, and npm's strict peer resolver rejects the devDep graph
+            # (bun accepts it). bump=none leaves package.json as-is.
+            ver="$(BUMP="$BUMP" PREID="$TAG" node -e '
+              const fs=require("fs"), p="./package.json", txt=fs.readFileSync(p,"utf8");
+              const cur=JSON.parse(txt).version, bump=process.env.BUMP, preid=process.env.PREID||"next";
+              const m=cur.match(/^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$/);
+              if(!m) throw new Error("unparseable version: "+cur);
+              const MA=+m[1], MI=+m[2], PA=+m[3], pre=m[4];
+              let v;
+              if(bump==="major") v=(MA+1)+".0.0";
+              else if(bump==="minor") v=MA+"."+(MI+1)+".0";
+              else if(bump==="patch") v=MA+"."+MI+"."+(PA+1);
+              else if(bump==="prerelease"){
+                if(pre){ const parts=pre.split("."), last=parts[parts.length-1];
+                  if(/^\d+$/.test(last)){ parts[parts.length-1]=String(+last+1); v=MA+"."+MI+"."+PA+"-"+parts.join("."); }
+                  else v=MA+"."+MI+"."+PA+"-"+pre+".0"; }
+                else v=MA+"."+MI+"."+(PA+1)+"-"+preid+".0";
+              } else v=cur; // none
+              if(v!==cur) fs.writeFileSync(p, txt.replace(/("version"\s*:\s*")[^"]+(")/, "$1"+v+"$2"));
+              process.stdout.write(v);
+            ')"
 
             bun run build
             # Bundle-real guard (mirrors the retired publish.yml): fail loudly on a stub bundle.
