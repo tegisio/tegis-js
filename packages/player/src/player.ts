@@ -250,6 +250,7 @@ export class TegisPlayer {
         preparing_count: q.preparing_count,
         preparing_ms: q.preparing_ms,
         rebuffer_count: q.rebuffer_count,
+        rebuffer_ms: q.rebuffer_ms,
       });
       if (typeof navigator !== "undefined" && typeof navigator.sendBeacon === "function") {
         navigator.sendBeacon(url, body);
@@ -296,6 +297,9 @@ export class TegisPlayer {
     video.addEventListener("waiting", () => {
       if (this.qoe.hasStarted()) this.qoe.addRebuffer();
     });
+    // Close the rebuffer span on resume (accumulates rebuffer_ms). Fires on every `playing`, not just the
+    // first — a no-op unless a rebuffer span is open.
+    video.addEventListener("playing", () => this.qoe.endRebuffer());
     // Terminal moments: emit the one-per-playback QoE beacon alongside the funnel completed/error step.
     video.addEventListener(
       "ended",
@@ -601,6 +605,10 @@ export class TegisPlayer {
       } catch {
         /* console may be absent */
       }
+      // Fleet visibility: beacon WHICH failure mode (decode / segment_fetch / codec_unsupported /
+      // no_first_frame / stalled / play_failed) as the `error` step's reason — so we can see why playback
+      // fails at scale, not just that it did. Best-effort (never throws into playback).
+      this.beacon("error", e.code);
       try {
         opts.onError?.(e);
       } catch {
