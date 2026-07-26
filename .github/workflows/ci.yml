@@ -1,0 +1,46 @@
+# CI — typecheck + test + build every package on every push to main and every PR, so red code can't
+# reach a release. The release workflow re-runs these gates before publishing; this catches regressions
+# earlier (at the change, not at release time).
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        pkg: [player, server]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.5" # pinned: match the release build toolchain
+
+      - name: Install workspace
+        run: bun install --frozen-lockfile
+
+      - name: Typecheck @tegis/${{ matrix.pkg }}
+        working-directory: packages/${{ matrix.pkg }}
+        run: bun run typecheck
+
+      - name: Test @tegis/${{ matrix.pkg }}
+        working-directory: packages/${{ matrix.pkg }}
+        run: bun test
+
+      - name: Build @tegis/${{ matrix.pkg }}
+        working-directory: packages/${{ matrix.pkg }}
+        run: bun run build

@@ -12,7 +12,6 @@
 #     Workflow filename:     release.yml
 #     Environment:           (leave blank)
 # Do this for BOTH @tegis/player and @tegis/server. The packages must already exist on npm (they do).
-# After the first green OIDC release you can delete the old token-based publish.yml.
 # ──────────────────────────────────────────────────────────────────────────────────────────────────
 
 name: release
@@ -49,8 +48,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - uses: oven-sh/setup-bun@v2
         with:
@@ -113,22 +110,55 @@ jobs:
           done
           echo "summary=${summary% }" >> "$GITHUB_OUTPUT"
 
-      - name: Commit + tag + push the bump
-        run: |
-          set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add packages/*/package.json
-          # bump=none makes no source change → nothing to commit; still tag + push the published versions.
-          if ! git diff --cached --quiet; then
-            git commit -m "release: ${{ steps.rel.outputs.summary }} [skip ci]"
-            git push origin "HEAD:${{ github.ref_name }}"
-          fi
-          for pkg in ${{ steps.sel.outputs.list }}; do
-            ver="$(node -p "require('./packages/$pkg/package.json').version")"
-            git tag "@tegis/$pkg@$ver" 2>/dev/null && git push origin "@tegis/$pkg@$ver" \
-              || echo "tag @tegis/$pkg@$ver already exists — skipping"
-          done
+      # Commit the version bump + tags through the GitHub API (git data API) rather than `git push`, so the
+      # commit is auto-signed by GitHub and shows as Verified — a plain runner `git push` would land an
+      # UNVERIFIED github-actions[bot] commit. bump=none makes no source change → skip the commit, still tag.
+      - name: Commit + tag the bump (signed via API)
+        uses: actions/github-script@v7
+        env:
+          PKGS: ${{ steps.sel.outputs.list }}
+          BUMP: ${{ inputs.bump }}
+          SUMMARY: ${{ steps.rel.outputs.summary }}
+        with:
+          script: |
+            const fs = require("fs");
+            const pkgs = process.env.PKGS.split(" ").filter(Boolean);
+            const { owner, repo } = context.repo;
+            const branch = context.ref.replace("refs/heads/", "");
+
+            const ref = await github.rest.git.getRef({ owner, repo, ref: `heads/${branch}` });
+            let sha = ref.data.object.sha;
+
+            if (process.env.BUMP !== "none") {
+              const base = await github.rest.git.getCommit({ owner, repo, commit_sha: sha });
+              const tree = pkgs.map((p) => ({
+                path: `packages/${p}/package.json`,
+                mode: "100644",
+                type: "blob",
+                content: fs.readFileSync(`packages/${p}/package.json`, "utf8"),
+              }));
+              const newTree = await github.rest.git.createTree({ owner, repo, base_tree: base.data.tree.sha, tree });
+              const commit = await github.rest.git.createCommit({
+                owner, repo,
+                message: `release: ${process.env.SUMMARY} [skip ci]`,
+                tree: newTree.data.sha,
+                parents: [sha],
+              });
+              await github.rest.git.updateRef({ owner, repo, ref: `heads/${branch}`, sha: commit.data.sha });
+              sha = commit.data.sha;
+              core.info(`signed commit ${sha} — ${process.env.SUMMARY}`);
+            }
+
+            for (const p of pkgs) {
+              const ver = JSON.parse(fs.readFileSync(`packages/${p}/package.json`, "utf8")).version;
+              const tag = `@tegis/${p}@${ver}`;
+              try {
+                await github.rest.git.createRef({ owner, repo, ref: `refs/tags/${tag}`, sha });
+                core.info(`tagged ${tag} → ${sha}`);
+              } catch (e) {
+                core.info(`tag ${tag} not created (${e.message})`);
+              }
+            }
 
       - name: Summary
         run: echo "### Released ${{ steps.rel.outputs.summary }} (dist-tag \`${{ inputs.tag }}\`)" >> "$GITHUB_STEP_SUMMARY"
