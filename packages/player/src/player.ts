@@ -360,9 +360,77 @@ export class TegisPlayer {
     return r.json;
   }
 
+  /** Decrypt + append each segment URL of one window, in order, serialized through the SourceBuffer. Returns
+   *  true when the stream reached its TRUE end — a segment fetch that fails (a 404 past the sealed content, or
+   *  a `preparing` retry budget exhausted) — so the caller stops renewing. `markFirst` fires the one-time
+   *  first-segment funnel beacon. Browser-only glue (the append closure drives MSE); the fetch/decrypt core is
+   *  the shared, headless-verifiable path. */
+  private async appendSegments(
+    assetId: string,
+    urls: string[],
+    key: Uint8Array,
+    append: (buf: Uint8Array) => Promise<void>,
+    markFirst: () => void,
+  ): Promise<boolean> {
+    for (const url of urls) {
+      let seg: Uint8Array;
+      try {
+        seg = await this.decryptedSegment(assetId, url, key); // 404 ⇒ past the end of the packaged content
+      } catch {
+        return true; // past the end, or unfetchable after the JIT backoff — stop the stream here
+      }
+      markFirst();
+      await append(seg);
+    }
+    return false; // whole window appended; more windows may follow
+  }
+
+  /** Resolve `true` when the forward buffer has drained below the low-water mark (time to renew the next
+   *  window) or `false` when playback ended / the MediaSource closed (stop the pump). Driven by `timeupdate`
+   *  (≈4×/s while playing) plus a 1s interval to cover the paused/stalled case — so it costs nothing while
+   *  idle and reacts to REAL playback progress, which keeps the renew pace honest (a paused player never
+   *  prefetches ahead). Browser-only. */
+  private awaitDrain(video: HTMLVideoElement, ms: MediaSource): Promise<boolean> {
+    const LOW_WATER_S = 8; // renew when < 8s of forward buffer remains (a window is ~30s → ample lead)
+    const aheadOfPlayhead = (): number => {
+      const b = video.buffered;
+      for (let i = 0; i < b.length; i++) {
+        if (b.start(i) <= video.currentTime + 0.25 && video.currentTime <= b.end(i) + 0.25) {
+          return b.end(i) - video.currentTime;
+        }
+      }
+      return 0;
+    };
+    return new Promise<boolean>((resolve) => {
+      let settled = false;
+      const settle = (v: boolean) => {
+        if (settled) return;
+        settled = true;
+        video.removeEventListener("timeupdate", check);
+        video.removeEventListener("ended", stop);
+        video.removeEventListener("error", stop);
+        clearInterval(iv);
+        resolve(v);
+      };
+      const check = () => {
+        if (video.ended || ms.readyState !== "open") return settle(false);
+        if (aheadOfPlayhead() < LOW_WATER_S) return settle(true);
+      };
+      const stop = () => settle(false);
+      video.addEventListener("timeupdate", check);
+      video.addEventListener("ended", stop);
+      video.addEventListener("error", stop);
+      const iv = setInterval(check, 1000);
+      check(); // the buffer may already be low (e.g. a very short first window)
+    });
+  }
+
   /**
-   * Full browser playback via MSE (browser-only): mint → append the init segment → fetch+decrypt+append
-   * each media segment → play. The att-gated key is fetched once. Returns the grant.
+   * Full browser playback via MSE (browser-only): mint → append the init segment → fetch+decrypt+append the
+   * first grant window → play → then a playback-paced renewal pump continues window-by-window past the first
+   * (see {@link pumpWindows}) until the asset's true end. The att-gated key is fetched once. Returns the grant
+   * as soon as the first window is playing (the pump runs detached) — so TTFF and the return contract are
+   * unchanged from the single-window player.
    */
   async play(video: HTMLVideoElement, opts: { assetId: string; entitlement: string; ses?: string; fph?: string; mime?: string; token?: string }): Promise<Grant> {
     // Fail fast with a clear message if the caller passed no element — otherwise the first thing we do
@@ -403,20 +471,26 @@ export class TegisPlayer {
         });
       await append(await this.fetchBytes(g.init)); // init segment (unencrypted codec config)
       let firstSeg = true;
-      for (const url of g.manifest) {
-        let seg: Uint8Array;
-        try {
-          seg = await this.decryptedSegment(opts.assetId, url, key); // 404 ⇒ past the end of the packaged content
-        } catch {
-          break;
-        }
+      const markFirst = () => {
         if (firstSeg) {
           firstSeg = false;
           this.beacon("first_segment_decrypted");
         }
-        await append(seg);
-      }
-      ms.endOfStream();
+      };
+      // Window 1 — the first grant window (the lead buffer). `reachedEnd` is true when this window already ran
+      // off the end of the packaged content (a segment 404): a SHORT asset that fits one grant window.
+      const reachedEnd = await this.appendSegments(opts.assetId, g.manifest, key, append, markFirst);
+
+      const endStream = () => {
+        if (ms.readyState === "open") {
+          try {
+            ms.endOfStream();
+          } catch {
+            /* already ended/closed */
+          }
+        }
+      };
+
       // Best-effort autoplay. Browsers block autoplay-with-audio when media engagement is low (e.g. an
       // incognito session, MEI=0). Muted autoplay is always permitted, so on a block fall back to muted
       // rather than leaving a frozen first frame; if it is still blocked, the element stays paused for the
@@ -434,6 +508,25 @@ export class TegisPlayer {
         }
       }
       g.autoplay = autoplay;
+
+      // Beyond one grant window (an asset LONGER than the tenant's segment TTL, ~30s): drive the renewal pump
+      // so playback continues past the first window instead of ending at it. PLAYBACK-PACED — it renews as the
+      // buffer drains, reporting the real currentTime, so the mint's realtime pace guard is always satisfied —
+      // and DETACHED, so play() still resolves at first-frame readiness (contract + TTFF unchanged). A short
+      // asset already reached its end above → just close the stream now. Best-effort: a pump failure ends the
+      // stream at whatever is buffered and never rejects the caller.
+      if (reachedEnd) {
+        endStream();
+      } else {
+        void pumpWindows({
+          windowTo: g.window.to,
+          reachedEnd,
+          renew: (pos, seq) => this.renew(g.playbackId, g.hbKeyB64u, { pos, seq }),
+          appendWindow: (urls) => this.appendSegments(opts.assetId, urls, key, append, markFirst),
+          awaitDrain: () => this.awaitDrain(video, ms),
+          pos: () => video.currentTime,
+        }).then(endStream, endStream);
+      }
       return g;
     } catch (e) {
       // The playback pipeline failed client-side (mint/key/decrypt/MSE). Record where, for the trace.
@@ -441,5 +534,59 @@ export class TegisPlayer {
       this.emitQoe(); // terminal: flush QoE for a client-side playback failure too
       throw e;
     }
+  }
+}
+
+/** A signed playback window returned by mint `/mint/v1` (grant) or `/mint/v1/renew`: the media-segment URLs
+ *  plus the inclusive segment range they cover. */
+export interface Window {
+  manifest: string[];
+  window: { from: number; to: number };
+}
+
+/** Collaborators for {@link pumpWindows} — injected so the loop is unit-testable with fakes (no MSE, no real
+ *  timers): `renew` fetches the next signed window, `appendWindow` decrypts+appends it (returning the true-end
+ *  flag), `awaitDrain` gates the next renew on playback draining the buffer, and `pos` reads the real position
+ *  reported to the mint's pace guard. */
+export interface PumpOpts {
+  /** The last segment index of the window already appended (window 1's `window.to`). */
+  windowTo: number;
+  /** True if the already-appended window ran off the end (short asset) — then the pump is a no-op. */
+  reachedEnd: boolean;
+  renew: (pos: number, seq: number) => Promise<Window>;
+  /** Append a window's segments; returns true when the stream reached its true end. */
+  appendWindow: (urls: string[]) => Promise<boolean>;
+  /** Resolve true when it is time to renew (buffer drained), false to stop the pump (playback ended). */
+  awaitDrain: () => Promise<boolean>;
+  /** Current playback position (seconds) reported to the pace guard — MUST be the real playhead, never ahead. */
+  pos: () => number;
+}
+
+/**
+ * Playback-paced renewal pump. Renews the grant window-by-window and appends each, waiting for the buffer to
+ * drain between windows, until the asset's true end (a segment 404 → `appendWindow` returns true, or the mint
+ * returns an empty window) or a stop (`awaitDrain` returns false / a renew failure). Extracted and exported so
+ * the loop is unit-testable with fakes — no MSE, no real timers.
+ *
+ * Pacing: `seq` is reported as the last-appended segment index (so it strictly advances each renew, satisfying
+ * the mint's replay guard), and `pos` is the REAL playhead — so `pos ≤ elapsed×1.25 + 5s` always holds for
+ * ≈1× playback and the mint never paces the honest pump out. It NEVER prefetches ahead of playback (a renew
+ * only fires once `awaitDrain` reports the buffer low), which is what keeps it honest. A renew rejection
+ * (expired grant, paced-out at high playback rates, network) ends the pump gracefully at the buffered content.
+ */
+export async function pumpWindows(opts: PumpOpts): Promise<void> {
+  let windowTo = opts.windowTo;
+  let reachedEnd = opts.reachedEnd;
+  while (!reachedEnd) {
+    if (!(await opts.awaitDrain())) return; // playback ended / element gone — stop, leave the stream as-is
+    let next: Window;
+    try {
+      next = await opts.renew(Math.floor(opts.pos()), windowTo);
+    } catch {
+      return; // grant expired / paced-out / network — end gracefully with what is buffered
+    }
+    if (!next.manifest || next.manifest.length === 0) return; // mint signalled no further window → true end
+    windowTo = next.window.to;
+    reachedEnd = await opts.appendWindow(next.manifest);
   }
 }
