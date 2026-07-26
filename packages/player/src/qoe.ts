@@ -14,6 +14,9 @@ export interface QoeSnapshot {
   preparing_ms: number;
   /** Post-start stall cycles (a `waiting` after the first frame) — the rebuffer count. */
   rebuffer_count: number;
+  /** Total ms the viewer spent rebuffering after start (sum of `waiting`→`playing` span durations). The
+   *  "how bad was it" companion to `rebuffer_count` ("how often"). */
+  rebuffer_ms: number;
 }
 
 /** Per-playback QoE accumulator. The player feeds it at the funnel / JIT touch-points; `snapshot()` is
@@ -25,6 +28,8 @@ export class QoeCollector {
   private preparingCount = 0;
   private preparingMs = 0;
   private rebufferCount = 0;
+  private rebufferMs = 0;
+  private rebufferStartedAt: number | null = null;
 
   /** @param now injectable monotonic clock (ms). Defaults to `performance.now()` (falls back to `Date.now()`). */
   constructor(now?: () => number) {
@@ -42,6 +47,8 @@ export class QoeCollector {
     this.preparingCount = 0;
     this.preparingMs = 0;
     this.rebufferCount = 0;
+    this.rebufferMs = 0;
+    this.rebufferStartedAt = null;
   }
 
   /** Stamp the play-request instant (the click / `play_requested` beacon). Opens the TTFF span. */
@@ -66,9 +73,20 @@ export class QoeCollector {
     this.preparingMs += Number.isFinite(waitMs) && waitMs > 0 ? waitMs : 0;
   }
 
-  /** Record one post-start rebuffer (a `waiting`→`playing` stall after the first frame). */
+  /** Record one post-start rebuffer (a `waiting` after the first frame): increments the count and opens the
+   *  duration span. Repeated `waiting`s within one stall keep the same span open (first `waiting` wins). */
   addRebuffer(): void {
     this.rebufferCount++;
+    if (this.rebufferStartedAt == null) this.rebufferStartedAt = this.now();
+  }
+
+  /** Close an open rebuffer span (the `playing` that resumes it), adding its duration to `rebuffer_ms`.
+   *  A no-op when no span is open (a `playing` that isn't ending a stall). */
+  endRebuffer(): void {
+    if (this.rebufferStartedAt != null) {
+      this.rebufferMs += Math.max(0, this.now() - this.rebufferStartedAt);
+      this.rebufferStartedAt = null;
+    }
   }
 
   /** The current QoE snapshot for the beacon body. TTFF stays 0 until a first frame is reached. */
@@ -82,6 +100,7 @@ export class QoeCollector {
       preparing_count: this.preparingCount,
       preparing_ms: Math.round(this.preparingMs),
       rebuffer_count: this.rebufferCount,
+      rebuffer_ms: Math.round(this.rebufferMs),
     };
   }
 }

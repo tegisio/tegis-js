@@ -66,7 +66,7 @@ test("play() throws a clear error when passed no video element (guards the wireF
 test("QoeCollector: TTFF math, hasStarted gate, preparing + rebuffer accumulation, reset", () => {
   let t = 500;
   const c = new QoeCollector(() => t);
-  expect(c.snapshot()).toEqual({ ttff_ms: 0, preparing_count: 0, preparing_ms: 0, rebuffer_count: 0 });
+  expect(c.snapshot()).toEqual({ ttff_ms: 0, preparing_count: 0, preparing_ms: 0, rebuffer_count: 0, rebuffer_ms: 0 });
   expect(c.hasStarted()).toBe(false);
 
   c.markPlayRequested(); // t = 500
@@ -80,10 +80,10 @@ test("QoeCollector: TTFF math, hasStarted gate, preparing + rebuffer accumulatio
   c.addRebuffer();
   c.addRebuffer();
 
-  expect(c.snapshot()).toEqual({ ttff_ms: 338, preparing_count: 3, preparing_ms: 2000, rebuffer_count: 2 });
+  expect(c.snapshot()).toEqual({ ttff_ms: 338, preparing_count: 3, preparing_ms: 2000, rebuffer_count: 2, rebuffer_ms: 0 });
 
   c.reset();
-  expect(c.snapshot()).toEqual({ ttff_ms: 0, preparing_count: 0, preparing_ms: 0, rebuffer_count: 0 });
+  expect(c.snapshot()).toEqual({ ttff_ms: 0, preparing_count: 0, preparing_ms: 0, rebuffer_count: 0, rebuffer_ms: 0 });
   expect(c.hasStarted()).toBe(false);
 });
 
@@ -162,8 +162,8 @@ test("envelope: the qoe beacon mirrors the funnel ids/shape and carries no geo /
 
   // Same envelope ids as a funnel beacon, routed by `step`.
   expect(qoe).toMatchObject({ ses: "ses_abc", pbk: "pbk_xyz", ast: "ast_1", step: "qoe" });
-  // The four pinned QoE metrics, all numeric.
-  for (const k of ["ttff_ms", "preparing_count", "preparing_ms", "rebuffer_count"]) {
+  // The pinned QoE metrics, all numeric.
+  for (const k of ["ttff_ms", "preparing_count", "preparing_ms", "rebuffer_count", "rebuffer_ms"]) {
     expect(qoe).toHaveProperty(k);
     expect(typeof qoe[k]).toBe("number");
   }
@@ -173,6 +173,31 @@ test("envelope: the qoe beacon mirrors the funnel ids/shape and carries no geo /
   }
   // Exact key set: the funnel envelope ids + the QoE metrics, nothing else.
   expect(Object.keys(qoe).sort()).toEqual(
-    ["ast", "pbk", "preparing_count", "preparing_ms", "rebuffer_count", "ses", "step", "ttff_ms"].sort(),
+    ["ast", "pbk", "preparing_count", "preparing_ms", "rebuffer_count", "rebuffer_ms", "ses", "step", "ttff_ms"].sort(),
   );
+});
+
+test("QoeCollector: rebuffer_ms accumulates the waiting→playing span durations (not just the count)", () => {
+  let t = 0;
+  const c = new QoeCollector(() => t);
+  c.markPlayRequested();
+  t = 10;
+  c.markFirstFrame(); // started
+  // stall 1: waiting at t=1000, resume at t=1600 → 600ms
+  t = 1000;
+  c.addRebuffer();
+  t = 1300;
+  c.addRebuffer(); // a second waiting within the SAME stall — keeps the span open, count still increments
+  t = 1600;
+  c.endRebuffer();
+  // stall 2: waiting at t=5000, resume at t=5250 → 250ms
+  t = 5000;
+  c.addRebuffer();
+  t = 5250;
+  c.endRebuffer();
+  const s = c.snapshot();
+  expect(s.rebuffer_count).toBe(3); // three `waiting`s
+  expect(s.rebuffer_ms).toBe(850); // 600 + 250 (a trailing `playing` with no open span is a no-op)
+  c.endRebuffer(); // no open span → no change
+  expect(c.snapshot().rebuffer_ms).toBe(850);
 });
