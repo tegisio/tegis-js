@@ -6,6 +6,11 @@
 
 import { handshake as wcHandshake, hbSign, decryptSegment, unb64u } from "./crypto.ts";
 import { QoeCollector } from "./qoe.ts";
+import { createMseSink, type MseSink } from "./mse.ts";
+
+// The MSE MediaSource/SourceBuffer helpers live in ./mse.ts now (they back MainThreadMseSink). Re-exported
+// here because they are part of this module's public surface (imported by the test suite from player.ts).
+export { createMediaSource, attachMediaSource, setMediaSourceDuration } from "./mse.ts";
 
 export interface BrowserPlayerConfig {
   mint: string;
@@ -58,6 +63,14 @@ export interface PreparingState {
   /** Backoff (ms) before the next attempt — honors `Retry-After` when present, else exponential; always
    *  clamped to `jit.maxDelayMs`, so this is the real wait the player will observe. */
   retryAfterMs: number;
+  /** Segments of the asset produced so far, when the origin reports it. Together with
+   *  {@link expectedSegments} this is what lets a host render real progress — "12 of 450 ready" — instead of a
+   *  spinner that could equally mean two seconds or two minutes. Absent on an origin that doesn't report it. */
+  producedThrough?: number;
+  /** Total segments the finished asset is expected to have, when the origin reports it. */
+  expectedSegments?: number;
+  /** Fraction of the asset produced so far (0..1), derived from the two above. Absent when either is. */
+  progress?: number;
 }
 
 /** A previously-`preparing` segment is now available (2xx) — the player transitions back to normal playback. */
@@ -83,6 +96,20 @@ export interface Grant {
   manifest: string[]; // signed media-segment URLs
   window: { from: number; to: number };
   res: string;
+  /** Total playable length of the ASSET in seconds — not of this window. Present once the origin publishes the
+   *  asset's shape; absent on an older edge or an asset whose shape hasn't been backfilled. `play()` uses it to
+   *  set `MediaSource.duration`, which is what gives the host a real scrubber: without it `video.duration` is
+   *  just the highest buffered timestamp and grows as playback proceeds. For a still-encoding asset this is the
+   *  EXPECTED final duration, so the viewer sees the true total from the first frame. */
+  duration?: number;
+  /** Number of delivery segments in the whole asset. Only present when the asset is sealed (`complete`), since
+   *  a still-encoding asset's produced head is not its end. */
+  segCount?: number;
+  /** Delivery segment grid in milliseconds (2000 today). */
+  segDurMs?: number;
+  /** Whether the asset is fully produced. `false` means playable but still encoding: `duration` is the expected
+   *  total, and segments past the produced head answer `preparing` until the encode catches up. */
+  complete?: boolean;
   /** Browser-only: outcome of the SDK's best-effort autoplay — `playing` (started as-is), `muted` (fell
    *  back to muted because autoplay-with-audio was blocked), or `blocked` (needs a user gesture). Lets a
    *  caller surface an unmute hint / play button instead of being left on a frozen frame. */
@@ -105,7 +132,14 @@ export interface PlayError {
     | "append"
     | "no_first_frame"
     | "stalled"
-    | "play_failed";
+    | "play_failed"
+    /** The MediaSource never reached `open` after attach — on Chrome, the main-thread
+     *  `URL.createObjectURL(MediaSource)` attach no longer fires `sourceopen` (issue #4).
+     *  Surfaced instead of hanging forever; the real fix is MSE-in-Workers. */
+    | "attach_failed"
+    /** A seek could not be authorized — the tenant hasn't enabled seeking, or the session has been signed for
+     *  as much of the asset as it is allowed. Playback continues from where it was; this is not fatal. */
+    | "seek_refused";
   message: string;
   cause?: unknown;
 }
@@ -143,8 +177,70 @@ export interface PlaybackHandle extends Grant {
 // Buffer pacing + watchdog tuning (browser hot path). HIGH_WATER caps how far ahead the feed loop fetches
 // (back-pressure); the watchdogs surface a legible error instead of a silent hang.
 const HIGH_WATER_S = 24; // stop fetching once this many seconds are buffered ahead of the playhead
+// Buffer target while PAUSED. A paused viewer is not watching, so continuing to pull toward the playing
+// target spends their bandwidth (order 10MB at 1080p) on content they just stopped. Small but non-zero, so
+// pressing play resumes instantly instead of re-buffering from nothing.
+const PAUSED_HIGH_WATER_S = 8;
+// Buffer target while PAUSED AND the page is hidden: fetch nothing new. Nobody is watching or looking.
+const HIDDEN_PAUSED_HIGH_WATER_S = 0;
+// Safety wake for the feed loop's back-pressure wait. The loop is event-driven (timeupdate/play/seeking/
+// visibilitychange); this only bounds the case where an expected event never arrives. It replaces a 500ms
+// poll that woke a parked, paused tab twice a second forever.
+const FEED_TICK_MS = 5_000;
 const FIRST_FRAME_TIMEOUT_MS = 12_000; // after the first segment is appended + play(), expect a frame within this
 const STALL_MS = 8_000; // currentTime stuck this long WITH buffered data ahead = a real (surfaced) stall
+// The MediaSource must reach `open` within this after attach. It normally fires in a few ms; the only case
+// it doesn't is Chrome's broken main-thread createObjectURL(MediaSource) attach (issue #4), which hangs
+// forever. Bounding it turns that silent hang into a surfaced `attach_failed` error. This is the ONE
+// pre-playback await with no watchdog otherwise — every later step is already timed.
+const MSE_ATTACH_TIMEOUT_MS = 8_000;
+
+/**
+ * Read cold-start progress off a `preparing` response's headers.
+ *
+ * `Retry-After` says WHEN to ask again; these say HOW FAR ALONG the asset is, which is the thing that answers
+ * a viewer's actual question — is this worth waiting for. Every field is optional: an older edge, or an asset
+ * whose shape isn't published, simply reports nothing and the host renders an indeterminate state as before.
+ */
+export function preparingProgress(r: { headers: { get(name: string): string | null } }): {
+  producedThrough?: number;
+  expectedSegments?: number;
+  progress?: number;
+} {
+  const num = (name: string): number | undefined => {
+    const raw = r.headers.get(name);
+    if (raw == null || raw === "") return undefined;
+    const n = Number(raw);
+    return Number.isFinite(n) && n >= 0 ? n : undefined;
+  };
+  const producedThrough = num("x-tegis-produced-through");
+  const expectedSegments = num("x-tegis-expected-segments");
+  const out: { producedThrough?: number; expectedSegments?: number; progress?: number } = {};
+  if (producedThrough !== undefined) out.producedThrough = producedThrough;
+  if (expectedSegments !== undefined) out.expectedSegments = expectedSegments;
+  if (producedThrough !== undefined && expectedSegments !== undefined && expectedSegments > 0) {
+    out.progress = Math.min(1, producedThrough / expectedSegments);
+  }
+  return out;
+}
+
+/** Whether `t` already sits inside a buffered range, with a small margin so a seek landing a hair outside a
+ *  range boundary still counts. This is the check that keeps ordinary scrubbing free: a viewer nudging back
+ *  ten seconds is almost always still inside the buffer, and must not cost a mint round trip to serve. */
+export function isBuffered(video: HTMLVideoElement, t: number, marginS = 0.25): boolean {
+  const b = video.buffered;
+  if (!b) return false;
+  for (let i = 0; i < b.length; i++) {
+    if (t >= b.start(i) - marginS && t <= b.end(i) + marginS) return true;
+  }
+  return false;
+}
+
+/** Whether the page is currently hidden. False in any non-DOM environment (headless tests, Bun), so the feed
+ *  loop there behaves exactly as a visible page would. */
+function isPageHidden(): boolean {
+  return typeof document !== "undefined" && document.visibilityState === "hidden";
+}
 
 /** An AbortError, cross-env (DOMException where present, else a tagged Error). */
 function abortError(): Error {
@@ -184,6 +280,36 @@ function onceEvent(target: EventTarget, name: string, signal: AbortSignal): Prom
   });
 }
 
+/** Like onceEvent, but rejects with a plain (non-abort) Error if the event doesn't fire within `timeoutMs`,
+ *  so a wedged one-shot await can't hang forever. Abort still rejects with an AbortError (distinguishable
+ *  via isAbort). Used for the MSE `sourceopen` attach, which hangs indefinitely on Chrome's broken
+ *  createObjectURL path (issue #4) — the timeout converts that into a surfaced `attach_failed`. */
+function onceEventWithTimeout(target: EventTarget, name: string, signal: AbortSignal, timeoutMs: number): Promise<void> {
+  return new Promise((res, rej) => {
+    if (signal.aborted) return rej(abortError());
+    let timer: ReturnType<typeof setTimeout>;
+    const cleanup = () => {
+      clearTimeout(timer);
+      target.removeEventListener(name, on);
+      signal.removeEventListener("abort", onAbort);
+    };
+    const on = () => {
+      cleanup();
+      res();
+    };
+    const onAbort = () => {
+      cleanup();
+      rej(abortError());
+    };
+    target.addEventListener(name, on, { once: true });
+    signal.addEventListener("abort", onAbort, { once: true });
+    timer = setTimeout(() => {
+      cleanup();
+      rej(new Error(`event "${name}" did not fire within ${timeoutMs}ms`));
+    }, timeoutMs);
+  });
+}
+
 /** A failed segment fetch is the stream's TRUE end (`"end"`) when it is a 404 past the sealed content or a
  *  phantom trailing segment (JIT `preparing` budget exhausted); any other failure is a real `"error"`. */
 function classifyFetchError(e: unknown): "end" | "error" {
@@ -201,6 +327,10 @@ export class TegisPlayer {
   private evtPbk?: string;
   private evtAst?: string;
   private watched = new Set<number>();
+  /** The ASSET's length in seconds for this playback, from the grant — 0 when the origin didn't report one.
+   *  The authoritative denominator for watch-through quartiles; never read `video.duration` for that, since
+   *  under MSE it tracks the buffer rather than the asset. */
+  private assetDurationSec = 0;
   /** Per-playback QoE accumulator (TTFF / preparing / rebuffer). Reset at the start of every `play()`. */
   private qoe: QoeCollector;
   /** Guards the single terminal `client.qoe` beacon per playback (the completed/error vs. page-unload race). */
@@ -318,8 +448,13 @@ export class TegisPlayer {
       { once: true },
     );
     video.addEventListener("timeupdate", () => {
-      const d = video.duration;
-      if (!d || !isFinite(d)) return;
+      // Watch-through quartiles are measured against the ASSET's length, never `video.duration`. Under MSE an
+      // undeclared duration tracks the buffer — roughly `currentTime + the ~24s prefetch lead` — so dividing by
+      // it yields `t/(t+24)`, a ratio independent of how long the asset actually is: `watched_25` would fire
+      // around 8s and `watched_75` around 72s whether the asset runs one minute or three hours. When the asset
+      // length is unknown we emit NOTHING rather than emit that.
+      const d = this.assetDurationSec;
+      if (!d || !isFinite(d) || d <= 0) return;
       const pctBucket = Math.floor((video.currentTime / d) * 100);
       for (const q of [25, 50, 75, 100]) {
         if (pctBucket >= q && !this.watched.has(q)) {
@@ -459,7 +594,7 @@ export class TegisPlayer {
         attempt++;
         const retryAfterMs = this.retryDelayMs(r, attempt, jit);
         this.qoe.addPreparing(retryAfterMs); // QoE: count this preparing occurrence + the ms it will wait
-        this.emitState({ state: "preparing", url: full, attempt, maxAttempts: jit.maxAttempts, retryAfterMs });
+        this.emitState({ state: "preparing", url: full, attempt, maxAttempts: jit.maxAttempts, retryAfterMs, ...preparingProgress(r) });
         this.beacon("preparing", "jit"); // e2e funnel: cold segment still preparing (best-effort)
         await this.sleep(retryAfterMs, signal);
         continue;
@@ -478,6 +613,32 @@ export class TegisPlayer {
   async decryptedSegment(assetId: string, url: string, key?: Uint8Array, signal?: AbortSignal): Promise<Uint8Array> {
     const k = key ?? (await this.contentKey(assetId, signal));
     return decryptSegment(k, await this.fetchBytes(url, signal));
+  }
+
+  /**
+   * Re-base playback at an arbitrary point: ask the mint for a signed window starting at `targetPos`.
+   *
+   * This is a different endpoint from {@link renew} because it asks for something renew structurally cannot
+   * give. Renew's window allocation is strictly forward and its pace guard measures from session start, so a
+   * viewer who drags to 1:30:00 of a two-hour film reports a position no elapsed-time bound could admit. Seek
+   * re-bases both: the window starts where the viewer actually went, and the pace anchor resets there.
+   *
+   * Rejects when the tenant hasn't enabled seek, or when the session has already been signed for more of the
+   * asset than viewing would account for. Callers treat a rejection as "stay where you are", never as a
+   * playback failure.
+   */
+  async seek(
+    playbackId: string,
+    hbKeyB64u: string,
+    targetPos: number,
+    progress: { pos: number; seq: number },
+    signal?: AbortSignal,
+  ): Promise<{ manifest: string[]; window: { from: number; to: number } }> {
+    const hb = { pbk: playbackId, pos: progress.pos, seq: progress.seq, state: "seeking", iat: Math.floor(Date.now() / 1000) };
+    const sig = await hbSign(hbKeyB64u, JSON.stringify(hb));
+    const r = await this.post("/mint/v1/seek", { playbackId, heartbeat: hb, sig, targetPos }, signal);
+    if (r.status !== 200) throw new Error("seek failed: " + r.status);
+    return r.json;
   }
 
   /** Steady-state renewal: report realtime progress to receive the next signed window. */
@@ -505,27 +666,41 @@ export class TegisPlayer {
     return 0;
   }
 
-  /** Resolve on the next real playback progress (`timeupdate`), end, error, abort, or a 500ms fallback tick —
-   *  so the feed loop's back-pressure wait reacts to the playhead draining the buffer, costs nothing while
-   *  idle, and never wedges (the fallback covers a paused/stalled element). Browser-only. */
+  /** Seconds of buffer the feed loop should keep ahead of the playhead RIGHT NOW. State-dependent, because a
+   *  single fixed target is what made pausing fail to stop the network: the loop's only signal was buffer
+   *  depth, so a paused element kept pulling until it was 24s ahead.
+   *
+   *  A hidden tab that is still PLAYING keeps the full target — backgrounded audio playback is a real use, and
+   *  starving it would stall the thing the viewer is actually listening to. */
+  private targetAheadS(video: HTMLVideoElement): number {
+    if (!video.paused) return HIGH_WATER_S;
+    return isPageHidden() ? HIDDEN_PAUSED_HIGH_WATER_S : PAUSED_HIGH_WATER_S;
+  }
+
+  /** Resolve on the next event that could change the feed loop's decision — playback progress (`timeupdate`),
+   *  a state change that raises the buffer target (`play`/`playing`/`seeking`), end, error, abort, or the page
+   *  becoming visible again — plus a long safety tick that bounds a missed event.
+   *
+   *  The events matter as much as the timeout: a PAUSED element emits no `timeupdate`, so without `play` and
+   *  `visibilitychange` the loop could only notice a resumed viewer via the timer. Browser-only. */
   private waitTick(video: HTMLVideoElement, signal: AbortSignal): Promise<void> {
     return new Promise((res) => {
       if (signal.aborted || typeof video.addEventListener !== "function") return res();
+      const events = ["timeupdate", "play", "playing", "seeking", "ended", "error"];
+      const doc = typeof document !== "undefined" && typeof document.addEventListener === "function" ? document : undefined;
       let done = false;
       const fin = () => {
         if (done) return;
         done = true;
         clearTimeout(t);
-        video.removeEventListener("timeupdate", fin);
-        video.removeEventListener("ended", fin);
-        video.removeEventListener("error", fin);
+        for (const e of events) video.removeEventListener(e, fin);
+        doc?.removeEventListener("visibilitychange", fin);
         signal.removeEventListener("abort", fin);
         res();
       };
-      const t = setTimeout(fin, 500);
-      video.addEventListener("timeupdate", fin);
-      video.addEventListener("ended", fin);
-      video.addEventListener("error", fin);
+      const t = setTimeout(fin, FEED_TICK_MS);
+      for (const e of events) video.addEventListener(e, fin);
+      doc?.addEventListener("visibilitychange", fin);
       signal.addEventListener("abort", fin, { once: true });
     });
   }
@@ -598,7 +773,7 @@ export class TegisPlayer {
     const signal = ac.signal;
     const cleanups: Array<() => void> = [];
     let stopped = false;
-    let ms: MediaSource | undefined;
+    let sink: MseSink | undefined; // the MSE sink (Worker- or main-thread-hosted); closed in teardown
     const onError = (e: PlayError): void => {
       try {
         console.error(`[tegis/player] ${e.code}: ${e.message}`, e.cause ?? "");
@@ -632,6 +807,11 @@ export class TegisPlayer {
         /* detached/gone */
       }
       try {
+        sink?.close(); // terminate the MSE worker (Worker sink) / drop refs (main-thread sink)
+      } catch {
+        /* best-effort */
+      }
+      try {
         (video as unknown as { srcObject: unknown }).srcObject = null; // detach an srcObject handle
       } catch {
         /* not srcObject */
@@ -663,6 +843,7 @@ export class TegisPlayer {
     this.evtAst = opts.assetId;
     this.evtPbk = undefined;
     this.watched.clear();
+    this.assetDurationSec = 0; // re-learned from this playback's grant; never carried over from the last one
     this.qoe.reset();
     this.qoeSent = false;
     if (opts.loop) video.loop = true;
@@ -692,57 +873,42 @@ export class TegisPlayer {
       const key = await this.contentKey(opts.assetId, signal, g.key);
       throwIfAborted(signal);
 
-      ms = createMediaSource();
-      attachMediaSource(video, ms);
-      await onceEvent(ms, "sourceopen", signal);
+      // The MSE "sink": a Worker-hosted MediaSource on Chrome/Edge/Firefox (the only attach that opens there —
+      // issue #4) and the main-thread ManagedMediaSource on Safari, chosen by createMseSink(). Every
+      // MediaSource/SourceBuffer touch below goes through it; play() is otherwise sink-agnostic.
+      sink = createMseSink();
+      const s = sink;
+      try {
+        await s.attach(video, signal, MSE_ATTACH_TIMEOUT_MS);
+      } catch (e) {
+        if (isAbort(e)) throw e;
+        const err: PlayError = {
+          code: "attach_failed",
+          message: `MediaSource never opened after ${MSE_ATTACH_TIMEOUT_MS}ms (attach via ${s.attachMethod}) — Chrome's main-thread createObjectURL(MediaSource) regression, worked around by the Worker sink (issue #4)`,
+          cause: e,
+        };
+        onError(err);
+        throw new Error(err.message);
+      }
+      // Declare the asset's real length up front. Without this, MSE leaves `duration` as the highest buffered
+      // timestamp, so `video.duration` grows as playback proceeds — the host can't render a total, the scrubber
+      // is unusable, and every percentage computed from it is wrong. Set once here, before any append; a later
+      // `endOfStream()` narrows it to the true buffered end, which self-corrects any rounding.
+      this.assetDurationSec = await s.setDuration(g.duration);
 
       // Derive the codec from the init `moov` (video-only H.264 High); gate on isTypeSupported.
       const initBytes = await this.fetchBytes(g.init, signal);
       const mime = opts.mime ?? codecsFromInit(initBytes) ?? DEFAULT_MIME;
-      if (!msTypeSupported(ms, mime)) {
+      const supported = await s.addSourceBuffer(mime);
+      if (!supported) {
         const e: PlayError = { code: "codec_unsupported", message: `this browser can't decode the content codec (${mime})` };
         onError(e);
         throw new Error(e.message);
       }
-      const sb = ms.addSourceBuffer(mime);
-      try {
-        sb.mode = "segments"; // CMAF bare fragments: chained baseMediaDecodeTime timing; overlap = last-write-wins
-      } catch {
-        /* segments is the default anyway */
-      }
 
       // Serialized, abortable append — resolves on updateend; rejects on the SourceBuffer error event, a
-      // synchronous appendBuffer throw, or abort.
-      const append = (buf: Uint8Array): Promise<void> =>
-        new Promise((res, rej) => {
-          if (signal.aborted) return rej(abortError());
-          const off = () => {
-            sb.removeEventListener("updateend", onEnd);
-            sb.removeEventListener("error", onErr);
-            signal.removeEventListener("abort", onAbort);
-          };
-          const onEnd = () => {
-            off();
-            res();
-          };
-          const onErr = () => {
-            off();
-            rej(new Error(`SourceBuffer append failed (codec "${mime}")`));
-          };
-          const onAbort = () => {
-            off();
-            rej(abortError());
-          };
-          sb.addEventListener("updateend", onEnd, { once: true });
-          sb.addEventListener("error", onErr, { once: true });
-          signal.addEventListener("abort", onAbort, { once: true });
-          try {
-            sb.appendBuffer(buf as BufferSource);
-          } catch (e) {
-            off();
-            rej(e); // synchronous QuotaExceeded / InvalidState → reject, never an unhandled throw
-          }
-        });
+      // synchronous appendBuffer throw, or abort. The sink owns those semantics (main-thread or in-worker).
+      const append = (buf: Uint8Array): Promise<void> => s.append(buf);
 
       // A decode/format failure surfaces as a MediaError on the <video>, NOT the SourceBuffer error event —
       // wire it for the whole playback so a mismatch is legible instead of a silent frozen frame.
@@ -802,31 +968,37 @@ export class TegisPlayer {
       }
       g.autoplay = autoplay;
 
-      const endStream = () => {
-        try {
-          if (ms && ms.readyState === "open") ms.endOfStream();
-        } catch {
-          /* already ended/closed */
-        }
-      };
+      const endStream = () => s.endOfStream();
 
       const handle: PlaybackHandle = Object.assign({}, g, { stop: teardown });
 
-      if (firstReachedEnd) {
-        endStream(); // the first segment was the whole clip (or an empty grant)
-      } else {
-        // The paced feed loop streams the rest across window boundaries, detached — play() returns at first frame.
+      // Seek support. The host seeks by setting `video.currentTime` — through our own controls, the browser's
+      // native ones, or a keyboard shortcut — so the player OBSERVES `seeking` rather than exposing a method.
+      // That way every way a viewer can scrub works, including ones we didn't write.
+      //
+      // Each feed run gets its own AbortController chained to the master one, so a seek can cancel the
+      // in-flight run (and its queued segments, now for the wrong part of the timeline) without tearing down
+      // the playback. `feedGen` makes rapid scrubbing safe: a run whose generation is stale exits instead of
+      // appending segments for a position the viewer has already left.
+      let feedGen = 0;
+      let feedAbort: AbortController | undefined;
+      const startFeed = (segments: string[], windowTo: number): void => {
+        const gen = ++feedGen;
+        feedAbort?.abort();
+        const ac2 = new AbortController();
+        feedAbort = ac2;
+        const stale = () => gen !== feedGen || signal.aborted || ac2.signal.aborted;
         void feedStream({
-          segments: manifest.slice(1),
-          windowTo: g.window.to,
-          highWaterS: HIGH_WATER_S,
-          aborted: () => signal.aborted,
+          segments,
+          windowTo,
+          targetAheadS: () => this.targetAheadS(video),
+          aborted: stale,
           isEnded: () => video.ended,
           bufferedAhead: () => this.bufferedAhead(video),
           waitTick: () => this.waitTick(video, signal),
-          fetchSegment: (url) => this.decryptedSegment(opts.assetId, url, key, signal),
+          fetchSegment: (url) => this.decryptedSegment(opts.assetId, url, key, ac2.signal),
           append,
-          renew: (pos, seq) => this.renew(g.playbackId, g.hbKeyB64u, { pos, seq }, signal),
+          renew: (pos, seq) => this.renew(g.playbackId, g.hbKeyB64u, { pos, seq }, ac2.signal),
           pos: () => video.currentTime,
           endStream,
           classifyError: classifyFetchError,
@@ -834,6 +1006,45 @@ export class TegisPlayer {
             if (reason === "error") onError({ code: "segment_fetch", message: "playback stream ended on error", cause: detail });
           },
         });
+      };
+
+      // Seeks are ordered by REQUEST, not by response arrival. `feedGen` alone cannot do this: it is
+      // incremented inside `startFeed`, which runs in the awaited continuation, so whichever mint response
+      // lands last wins regardless of which seek the viewer made last. Two quick scrubs where the earlier
+      // response is slower would leave the feed filling around the OLD target while the playhead sits at the
+      // new one — and nothing surfaces it, because the stall watchdog requires buffered data ahead and there
+      // is none. `seekReq` is captured before awaiting, so a superseded response is simply dropped.
+      let seekReq = 0;
+      const onSeeking = (): void => {
+        const target = video.currentTime;
+        // A seek landing inside buffered data needs no network at all — MSE simply plays from there. Scrubbing
+        // back a few seconds is the common case, and it must not cost a mint round trip.
+        if (isBuffered(video, target)) return;
+        const mine = ++seekReq;
+        void (async () => {
+          try {
+            const win = await this.seek(g.playbackId, g.hbKeyB64u, target, { pos: target, seq: g.window.to }, signal);
+            if (signal.aborted || mine !== seekReq) return; // a newer seek superseded this one
+            if (!win.manifest?.length) return; // refused or past the end — stay put rather than fail playback
+            startFeed(win.manifest, win.window.to);
+          } catch (e) {
+            // A refused seek is not a playback failure: the tenant may not have seek enabled, or the session
+            // may have acquired enough of the asset. Surface it, leave the viewer where they are.
+            if (!isAbort(e) && mine === seekReq) onError({ code: "seek_refused", message: e instanceof Error ? e.message : "seek refused", cause: e });
+          }
+        })();
+      };
+      video.addEventListener("seeking", onSeeking);
+      cleanups.push(() => {
+        video.removeEventListener("seeking", onSeeking);
+        feedAbort?.abort();
+      });
+
+      if (firstReachedEnd) {
+        endStream(); // the first segment was the whole clip (or an empty grant)
+      } else {
+        // The paced feed loop streams the rest across window boundaries, detached — play() returns at first frame.
+        startFeed(manifest.slice(1), g.window.to);
       }
 
       return handle;
@@ -850,51 +1061,13 @@ export class TegisPlayer {
   }
 }
 
-// ---- MSE attachment (browser) ---------------------------------------------------------------------------
-// Newer/non-standard MSE surface not always in the TS DOM lib: ManagedMediaSource (iOS Safari; plain
-// MediaSource is unsupported there) and the MediaSourceHandle exposed as `MediaSource.prototype.handle`,
-// attached via `video.srcObject`. Declared loosely so the player builds against any lib.dom version.
-type MediaSourceLike = MediaSource & { handle?: unknown };
-
-/** Create the playback MediaSource, preferring ManagedMediaSource where present (required on iOS Safari,
- *  where plain MediaSource is unavailable) and falling back to the standard MediaSource. Same API surface
- *  either way (addSourceBuffer / endOfStream), so the rest of play() is unchanged. */
-export function createMediaSource(): MediaSource {
-  const MMS = (globalThis as unknown as { ManagedMediaSource?: typeof MediaSource }).ManagedMediaSource;
-  const Ctor = MMS ?? MediaSource;
-  return new Ctor();
-}
-
-/** Attach a MediaSource to a video element, preferring the modern MediaSourceHandle + `srcObject` — the path
- *  that survives Chrome's removal of `URL.createObjectURL(MediaSource)` and is REQUIRED for ManagedMediaSource
- *  (iOS) — and falling back to the object URL only where a handle isn't available. Returns the method used. */
-export function attachMediaSource(video: HTMLVideoElement, ms: MediaSource): "srcObject" | "objectURL" {
-  const handle = (ms as MediaSourceLike).handle;
-  if (handle != null && "srcObject" in video) {
-    // srcObject/disableRemotePlayback typed loosely (via unknown) so the assignment builds against any
-    // lib.dom version. ManagedMediaSource requires remote playback disabled; a no-op for a plain handle.
-    const v = video as unknown as { srcObject: unknown; disableRemotePlayback?: boolean };
-    v.disableRemotePlayback = true;
-    v.srcObject = handle;
-    return "srcObject";
-  }
-  video.src = URL.createObjectURL(ms);
-  return "objectURL";
-}
-
 // ---- SourceBuffer codec derivation (browser + headless-testable) ----------------------------------------
+// (MSE attachment + the createMediaSource/attachMediaSource/setMediaSourceDuration/msTypeSupported helpers
+//  now live in ./mse.ts, where they back MainThreadMseSink; they are re-exported from the top of this file.)
 
 /** Last-resort SourceBuffer codec, used only when the caller passes no `mime` AND the init segment can't be
  *  parsed. H.264 High@L4.0 + AAC-LC fits typical 1080p output far better than the old Main@L3.0 guess. */
 const DEFAULT_MIME = 'video/mp4; codecs="avc1.640028,mp4a.40.2"';
-
-/** `MediaSource.isTypeSupported` via the CONSTRUCTOR actually in use (ManagedMediaSource on iOS has its own).
- *  Returns true when the platform exposes no `isTypeSupported` — never block playback on a missing probe. */
-function msTypeSupported(ms: MediaSource, mime: string): boolean {
-  const ctor = (ms as unknown as { constructor?: { isTypeSupported?: (t: string) => boolean } }).constructor;
-  const fn = ctor?.isTypeSupported;
-  return typeof fn === "function" ? fn.call(ctor, mime) : true;
-}
 
 // ---- minimal ISO-BMFF (fMP4) box reader — just enough of `moov` to read the codec strings ----------------
 
@@ -1054,8 +1227,10 @@ export interface FeedOpts {
   segments: string[];
   /** Last segment index of the current window (its `window.to`) — reported as `seq` to the mint on renew. */
   windowTo: number;
-  /** Stop fetching once this many seconds are buffered ahead of the playhead (back-pressure). */
-  highWaterS: number;
+  /** Seconds of buffer to keep ahead of the playhead, evaluated on EVERY back-pressure check rather than
+   *  fixed once — that is what lets a pause, or the page being hidden, lower the target and stop the loop
+   *  pulling content nobody is watching. */
+  targetAheadS: () => number;
   aborted: () => boolean;
   isEnded: () => boolean;
   /** Seconds buffered ahead of the playhead — the back-pressure signal. */
@@ -1103,8 +1278,10 @@ export async function feedStream(o: FeedOpts): Promise<void> {
         windowTo = next.window.to;
         continue;
       }
-      // Back-pressure: hold once ~highWaterS seconds are buffered ahead; resume as the playhead drains it.
-      while (!o.aborted() && !o.isEnded() && o.bufferedAhead() >= o.highWaterS) {
+      // Back-pressure: hold once the CURRENT target is met; resume as the playhead drains it or the target
+      // rises (the viewer pressed play, or came back to the tab). Re-read every pass — a target captured once
+      // is exactly the bug that let a paused player keep filling to the playing target.
+      while (!o.aborted() && !o.isEnded() && o.bufferedAhead() >= o.targetAheadS()) {
         await o.waitTick();
       }
       if (o.aborted() || o.isEnded()) break;
