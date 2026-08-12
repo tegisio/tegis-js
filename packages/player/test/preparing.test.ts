@@ -130,3 +130,40 @@ test("the preparing state hook is observable via config.onState with the documen
   expect(typeof prep!.retryAfterMs).toBe("number");
   expect(prep!.retryAfterMs).toBe(0); // Retry-After: 0 → 0ms
 });
+
+// ---- cold-start progress (docs/player-streaming-ux-plan.md §3.4) ---------------------------------------
+//
+// `Retry-After` tells the player when to ask again; these headers tell it how far along the asset is, which
+// is what answers a viewer's "is this worth waiting for". All optional — an older edge reports nothing.
+import { preparingProgress } from "../src/player.ts";
+
+const hdrs = (m: Record<string, string>) => ({ headers: { get: (k: string) => m[k.toLowerCase()] ?? null } });
+
+test("preparingProgress derives a fraction from produced/expected", () => {
+  const got = preparingProgress(hdrs({ "x-tegis-produced-through": "12", "x-tegis-expected-segments": "450" }));
+  expect(got.producedThrough).toBe(12);
+  expect(got.expectedSegments).toBe(450);
+  expect(got.progress).toBeCloseTo(12 / 450, 6);
+});
+
+test("preparingProgress reports nothing when the origin sends no headers", () => {
+  expect(preparingProgress(hdrs({}))).toEqual({});
+});
+
+test("preparingProgress reports the count alone when the total is unknown", () => {
+  const got = preparingProgress(hdrs({ "x-tegis-produced-through": "7" }));
+  expect(got.producedThrough).toBe(7);
+  expect(got.progress).toBeUndefined();
+});
+
+test("preparingProgress ignores garbled values rather than rendering NaN%", () => {
+  const got = preparingProgress(hdrs({ "x-tegis-produced-through": "abc", "x-tegis-expected-segments": "-3" }));
+  expect(got).toEqual({});
+});
+
+test("preparingProgress clamps a produced count that overshoots the estimate", () => {
+  // A partial asset's expected count is an ESTIMATE, so production can legitimately pass it. Progress must
+  // still read as complete rather than 104%.
+  const got = preparingProgress(hdrs({ "x-tegis-produced-through": "470", "x-tegis-expected-segments": "450" }));
+  expect(got.progress).toBe(1);
+});
