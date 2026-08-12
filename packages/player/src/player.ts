@@ -133,9 +133,9 @@ export interface PlayError {
     | "no_first_frame"
     | "stalled"
     | "play_failed"
-    /** The MediaSource never reached `open` after attach — on Chrome, the main-thread
-     *  `URL.createObjectURL(MediaSource)` attach no longer fires `sourceopen` (issue #4).
-     *  Surfaced instead of hanging forever; the real fix is MSE-in-Workers. */
+    /** The MediaSource never reached `open` after attach — it timed out waiting for `sourceopen`, the worker
+     *  hosting it failed to start, or the element rejected the handle. Surfaced instead of hanging forever;
+     *  `message` names the attach path actually used and carries the underlying reason. */
     | "attach_failed"
     /** A seek could not be authorized — the tenant hasn't enabled seeking, or the session has been signed for
      *  as much of the asset as it is allowed. Playback continues from where it was; this is not fatal. */
@@ -234,6 +234,31 @@ export function isBuffered(video: HTMLVideoElement, t: number, marginS = 0.25): 
     if (t >= b.start(i) - marginS && t <= b.end(i) + marginS) return true;
   }
   return false;
+}
+
+/** The position closest to `t` that sits inside a buffered range, or `undefined` when nothing is buffered.
+ *
+ *  This is what "stay where you are" needs after a refused seek. A playhead parked outside every buffered range
+ *  is not merely showing the wrong frame: `bufferedAhead()` reports 0 for it, so the feed loop's back-pressure
+ *  hold can never be satisfied and it fetches flat out, while the stall watchdog — which requires buffered data
+ *  ahead — cannot fire. Returning the nearest in-range position covers the case where the pre-seek position has
+ *  since been evicted from the buffer. */
+export function nearestBufferedPos(video: HTMLVideoElement, t: number): number | undefined {
+  const b = video.buffered;
+  if (!b || b.length === 0) return undefined;
+  let best: number | undefined;
+  let bestDist = Infinity;
+  for (let i = 0; i < b.length; i++) {
+    const start = b.start(i);
+    const end = b.end(i);
+    const clamped = t < start ? start : t > end ? end : t;
+    const dist = Math.abs(clamped - t);
+    if (dist < bestDist) {
+      bestDist = dist;
+      best = clamped;
+    }
+  }
+  return best;
 }
 
 /** Whether the page is currently hidden. False in any non-DOM environment (headless tests, Bun), so the feed
@@ -882,13 +907,17 @@ export class TegisPlayer {
         await s.attach(video, signal, MSE_ATTACH_TIMEOUT_MS);
       } catch (e) {
         if (isAbort(e)) throw e;
+        // Report the reason the attach ACTUALLY failed, not a fixed narrative. There are several attach paths
+        // (worker handle / srcObject / object URL) with genuinely different causes — a sourceopen timeout, a
+        // worker that couldn't start, a CSP that forbids blob: workers — and `cause` is dropped by the beacon
+        // and by most host onError handlers, so whatever the top-line message says is what an operator debugs.
         const err: PlayError = {
           code: "attach_failed",
-          message: `MediaSource never opened after ${MSE_ATTACH_TIMEOUT_MS}ms (attach via ${s.attachMethod}) — Chrome's main-thread createObjectURL(MediaSource) regression, worked around by the Worker sink (issue #4)`,
+          message: `MediaSource never reached "open" (attach via ${s.attachMethod}): ${e instanceof Error ? e.message : String(e)}`,
           cause: e,
         };
         onError(err);
-        throw new Error(err.message);
+        throw new Error(err.message, { cause: e });
       }
       // Declare the asset's real length up front. Without this, MSE leaves `duration` as the highest buffered
       // timestamp, so `video.duration` grows as playback proceeds — the host can't render a total, the scrubber
@@ -908,7 +937,24 @@ export class TegisPlayer {
 
       // Serialized, abortable append — resolves on updateend; rejects on the SourceBuffer error event, a
       // synchronous appendBuffer throw, or abort. The sink owns those semantics (main-thread or in-worker).
-      const append = (buf: Uint8Array): Promise<void> => s.append(buf);
+      //
+      // Every append in this playback — init, first segment, and each feed run's segments — goes through ONE
+      // promise chain. Awaiting a single loop's appends is not enough once seeking exists: a superseded feed
+      // run whose fetch already resolved will still call append, and if the SourceBuffer is `updating` when the
+      // NEW run's first append lands, appendBuffer throws InvalidStateError synchronously. That rejection is
+      // attributed to the surviving run (it isn't stale, so it doesn't swallow it), which ends the feed for the
+      // position the viewer just seeked to — a permanent freeze the stall watchdog can't even see, because it
+      // requires buffered data ahead and there is none. Chaining makes the overlap harmless: the late append
+      // simply lands first. A rejected link must not poison the chain, so the tail always continues.
+      let appendChain: Promise<unknown> = Promise.resolve();
+      const append = (buf: Uint8Array): Promise<void> => {
+        const done = appendChain.then(
+          () => s.append(buf),
+          () => s.append(buf),
+        );
+        appendChain = done.catch(() => {});
+        return done;
+      };
 
       // A decode/format failure surfaces as a MediaError on the <video>, NOT the SourceBuffer error event —
       // wire it for the whole playback so a mismatch is legible instead of a silent frozen frame.
@@ -980,6 +1026,20 @@ export class TegisPlayer {
       // in-flight run (and its queued segments, now for the wrong part of the timeline) without tearing down
       // the playback. `feedGen` makes rapid scrubbing safe: a run whose generation is stale exits instead of
       // appending segments for a position the viewer has already left.
+      // The live window position, and the highest `seq` this playback has reported to the mint. The heartbeat
+      // contract is strictly monotonic per playback and renew + seek SHARE that counter, so a seek cannot sign
+      // with the grant's original `window.to`: the very first renew already spends it, and every later seek
+      // would present a replayed value the mint must deny. `curWindowTo` follows the window as the feed renews
+      // and as a seek re-bases it; `reportedSeq` is a running maximum because a seek can legitimately move the
+      // timeline BACKWARD, which would otherwise make the next value go down.
+      let curWindowTo = g.window.to;
+      let reportedSeq = 0;
+      /** The seq to sign a SEEK heartbeat with: the CURRENT window, forced past everything already reported. */
+      const seekSeq = (): number => {
+        reportedSeq = Math.max(curWindowTo, reportedSeq + 1);
+        return reportedSeq;
+      };
+
       let feedGen = 0;
       let feedAbort: AbortController | undefined;
       const startFeed = (segments: string[], windowTo: number): void => {
@@ -987,6 +1047,7 @@ export class TegisPlayer {
         feedAbort?.abort();
         const ac2 = new AbortController();
         feedAbort = ac2;
+        curWindowTo = windowTo;
         const stale = () => gen !== feedGen || signal.aborted || ac2.signal.aborted;
         void feedStream({
           segments,
@@ -997,8 +1058,19 @@ export class TegisPlayer {
           bufferedAhead: () => this.bufferedAhead(video),
           waitTick: () => this.waitTick(video, signal),
           fetchSegment: (url) => this.decryptedSegment(opts.assetId, url, key, ac2.signal),
-          append,
-          renew: (pos, seq) => this.renew(g.playbackId, g.hbKeyB64u, { pos, seq }, ac2.signal),
+          // A superseded run's fetch can resolve AFTER a seek started a new one; its bytes belong to a window
+          // the viewer has left, so drop them rather than append them. The chained `append` above still covers
+          // the case where staleness flips while an append is already in flight.
+          append: (buf) => (stale() ? Promise.resolve() : append(buf)),
+          renew: (pos, seq) => {
+            // Renew keeps reporting the RAW window it is finishing — that is what the mint allocates the next
+            // window from. Only record it, so a later seek knows what floor it has to clear.
+            reportedSeq = Math.max(reportedSeq, seq);
+            return this.renew(g.playbackId, g.hbKeyB64u, { pos, seq }, ac2.signal);
+          },
+          onWindow: (w) => {
+            if (!stale()) curWindowTo = w; // a seek made now must sign against the window the feed just took
+          },
           pos: () => video.currentTime,
           endStream,
           classifyError: classifyFetchError,
@@ -1014,6 +1086,37 @@ export class TegisPlayer {
       // response is slower would leave the feed filling around the OLD target while the playhead sits at the
       // new one — and nothing surfaces it, because the stall watchdog requires buffered data ahead and there
       // is none. `seekReq` is captured before awaiting, so a superseded response is simply dropped.
+      // The last position the playhead held while NOT seeking — where "stay where you are" actually means.
+      // The host sets `currentTime` before `seeking` fires, so by the time we learn about a seek the pre-seek
+      // position is already gone from the element; this remembers it.
+      let lastStablePos = video.currentTime || 0;
+      const trackPos = () => {
+        if (!video.seeking) lastStablePos = video.currentTime;
+      };
+      if (typeof video.addEventListener === "function") {
+        video.addEventListener("timeupdate", trackPos);
+        cleanups.push(() => video.removeEventListener("timeupdate", trackPos));
+      }
+
+      /**
+       * Put the playhead back inside buffered media after a seek the mint would not authorize.
+       *
+       * `seek_refused` promises the viewer keeps playing from where they were, but the host already MOVED the
+       * playhead to the unbuffered target before `seeking` fired — so without this the picture freezes there
+       * permanently. Worse, it also defeats back-pressure: `bufferedAhead()` reads 0 for a playhead inside no
+       * range, so the surviving feed run's hold is never satisfied and it downloads the rest of the asset at
+       * full speed while the viewer stares at a frozen frame. Snapping back restores both.
+       */
+      const restorePlayhead = (): void => {
+        const back = nearestBufferedPos(video, lastStablePos);
+        if (back === undefined) return; // nothing buffered anywhere — there is no better place to be
+        try {
+          video.currentTime = back; // re-fires `seeking`, which returns early: `back` is buffered by construction
+        } catch {
+          /* detached element */
+        }
+      };
+
       let seekReq = 0;
       const onSeeking = (): void => {
         const target = video.currentTime;
@@ -1023,14 +1126,20 @@ export class TegisPlayer {
         const mine = ++seekReq;
         void (async () => {
           try {
-            const win = await this.seek(g.playbackId, g.hbKeyB64u, target, { pos: target, seq: g.window.to }, signal);
-            if (signal.aborted || mine !== seekReq) return; // a newer seek superseded this one
-            if (!win.manifest?.length) return; // refused or past the end — stay put rather than fail playback
+            const win = await this.seek(g.playbackId, g.hbKeyB64u, target, { pos: target, seq: seekSeq() }, signal);
+            if (signal.aborted || mine !== seekReq) return; // a newer seek superseded this one — it owns the playhead
+            if (!win.manifest?.length) {
+              restorePlayhead(); // refused or past the end — put the viewer back, don't fail playback
+              return;
+            }
             startFeed(win.manifest, win.window.to);
           } catch (e) {
             // A refused seek is not a playback failure: the tenant may not have seek enabled, or the session
-            // may have acquired enough of the asset. Surface it, leave the viewer where they are.
-            if (!isAbort(e) && mine === seekReq) onError({ code: "seek_refused", message: e instanceof Error ? e.message : "seek refused", cause: e });
+            // may have acquired enough of the asset. Surface it, put the viewer back where they were.
+            if (!isAbort(e) && mine === seekReq) {
+              restorePlayhead();
+              onError({ code: "seek_refused", message: e instanceof Error ? e.message : "seek refused", cause: e });
+            }
           }
         })();
       };
@@ -1252,6 +1361,10 @@ export interface FeedOpts {
   endStream: () => void;
   /** Classify a failed `fetchSegment`: `"end"` (404-past-end / phantom) stops silently; `"error"` surfaces. */
   classifyError: (e: unknown) => "end" | "error";
+  /** Called with the new `window.to` every time the loop takes a renewed window. The heartbeat `seq` counter is
+   *  shared with the seek path, which lives outside this loop — without this the orchestrator would keep signing
+   *  seeks against the window playback STARTED on, a value the first renew has already spent. */
+  onWindow?: (windowTo: number) => void;
   onEnd?: (reason: "complete" | "aborted" | "error", detail?: unknown) => void;
 }
 
@@ -1281,6 +1394,7 @@ export async function feedStream(o: FeedOpts): Promise<void> {
         if (!next.manifest || next.manifest.length === 0) break; // mint's true-end signal
         segments = next.manifest;
         windowTo = next.window.to;
+        o.onWindow?.(windowTo);
         continue;
       }
       // Back-pressure: hold once the CURRENT target is met; resume as the playhead drains it or the target
