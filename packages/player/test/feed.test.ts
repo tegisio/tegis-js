@@ -28,7 +28,7 @@ function harness(h: {
   const o: FeedOpts = {
     segments: h.window1,
     windowTo: 15,
-    highWaterS: 24,
+    targetAheadS: () => 24,
     aborted: () => false,
     isEnded: () => false,
     bufferedAhead: () => 0,
@@ -121,7 +121,7 @@ test("back-pressure: waits while buffered >= highWater, resumes + appends once i
   await feedStream({
     segments: ["s2"],
     windowTo: 15,
-    highWaterS: 24,
+    targetAheadS: () => 24,
     aborted: () => false,
     isEnded: () => false,
     bufferedAhead: () => ahead,
@@ -149,7 +149,7 @@ test("abort stops immediately, reports onEnd('aborted'), and never seals", async
   await feedStream({
     segments: ["s2", "s3", "s4"],
     windowTo: 15,
-    highWaterS: 24,
+    targetAheadS: () => 24,
     aborted: () => n >= 1, // abort after the first append
     isEnded: () => false,
     bufferedAhead: () => 0,
