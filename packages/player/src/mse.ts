@@ -1,10 +1,12 @@
-// @tegis/player — the MSE "sink": the MediaSource/SourceBuffer half of play(), factored behind an interface
-// so the browser-specific attach quirk (issue #4) lives in ONE place. Chrome/Edge/Firefox no longer open a
-// main-thread MediaSource attached via `URL.createObjectURL(ms)` — `sourceopen` never fires, so playback
-// hangs. The ONLY attach that opens there is a MediaSource constructed INSIDE a Worker, whose transferable
-// `MediaSourceHandle` is attached on the page via `video.srcObject`. Safari's ManagedMediaSource still works
-// (and self-manages buffering) on the main thread, so it keeps that path. `createMseSink()` picks per browser
-// and the rest of play() is sink-agnostic. This module owns nothing of the mint/decrypt/pacing logic.
+// @tegis/player — the MSE "sink": the MediaSource/SourceBuffer half of play(), factored behind an interface so
+// the browser-specific attach paths live in ONE place. Two implementations: a MediaSource constructed INSIDE a
+// dedicated Worker, whose transferable `MediaSourceHandle` is attached on the page via `video.srcObject`
+// (investigated for issue #4), and the main-thread MediaSource/ManagedMediaSource that predates it. The
+// main-thread attach is NOT broken — issue #4's Chrome hang turned out to be an automation-browser artifact, a
+// real foreground Chrome opens both — so the worker path is an alternative, never a prerequisite: it is gated
+// on `MediaSource.canConstructInDedicatedWorker` and falls back to the main thread on any attach failure.
+// `createMseSink()` picks; the rest of play() is sink-agnostic. This module owns nothing of the mint/decrypt/
+// pacing logic.
 
 // ---- cross-env helpers (mirrored from player.ts so this module imports nothing from the orchestrator it
 //      backs — keeps the dependency one-directional: player.ts → mse.ts) ---------------------------------
@@ -18,6 +20,11 @@ function abortError(): Error {
     e.name = "AbortError";
     return e;
   }
+}
+
+/** Whether a rejection is a caller abort rather than a real failure — the one case a fallback must NOT retry. */
+function isAbort(e: unknown): boolean {
+  return e instanceof Error && e.name === "AbortError";
 }
 
 // Newer/non-standard MSE surface not always in the TS DOM lib: ManagedMediaSource (iOS Safari; plain
@@ -37,8 +44,7 @@ export function createMediaSource(): MediaSource {
 /** Attach a MediaSource to a video element, preferring the modern MediaSourceHandle + `srcObject` — the path
  *  that survives Chrome's removal of `URL.createObjectURL(MediaSource)` and is REQUIRED for ManagedMediaSource
  *  (iOS) — and falling back to the object URL only where a handle isn't available. Returns the method used.
- *  NOTE: a MAIN-THREAD MediaSource has no `.handle`, so on Chrome this always takes the objectURL branch —
- *  which no longer opens (issue #4). That is why `WorkerMseSink` exists; this helper backs the Safari path. */
+ *  NOTE: a MAIN-THREAD MediaSource has no `.handle`, so outside Safari this takes the objectURL branch. */
 export function attachMediaSource(video: HTMLVideoElement, ms: MediaSource): "srcObject" | "objectURL" {
   const handle = (ms as MediaSourceLike).handle;
   if (handle != null && "srcObject" in video) {
@@ -84,9 +90,11 @@ function msTypeSupported(ms: MediaSource, mime: string): boolean {
 }
 
 /** Await a MediaSource reaching `open` (`sourceopen`), rejecting with a plain Error after `timeoutMs` and an
- *  AbortError on `signal`. The main-thread analogue of the bound that turns Chrome's silent attach hang
- *  (issue #4) into a surfaced `attach_failed`; only the ManagedMediaSource/Safari path uses it now, since the
- *  Worker path bounds its own open inside {@link WorkerMseSink.attach}. */
+ *  AbortError on `signal`. This is the bound that turns a MediaSource that never opens — for whatever reason —
+ *  into a surfaced `attach_failed` instead of a play() that hangs forever. The rejection is deliberately a
+ *  PLAIN Error, never an AbortError: play() rethrows aborts untouched as caller teardown, so a timeout that
+ *  arrived tagged as an abort would kill playback with no error surfaced at all. The Worker path bounds its own
+ *  open inside {@link WorkerMseSink.attach}; this backs the main-thread sink. */
 function waitForOpen(ms: MediaSource, signal: AbortSignal, timeoutMs: number): Promise<void> {
   return new Promise<void>((res, rej) => {
     if (signal.aborted) return rej(abortError());
@@ -148,7 +156,9 @@ export interface MseSink {
  * behavior play() had before the Worker sink, unchanged, backed by the helpers above.
  */
 class MainThreadMseSink implements MseSink {
-  attachMethod = "";
+  // Named before the attach runs, so the attach_failed diagnostic reports something even when the failure is
+  // the attach itself (an element that rejects the handle, a createObjectURL that throws).
+  attachMethod = "unknown";
   private ms?: MediaSource;
   private sb?: SourceBuffer;
   private mime = "";
@@ -252,8 +262,8 @@ interface WorkerMsg {
 // and answers duration/addsb/append/eos. priv.fan's CSP already allows `worker-src 'self' blob:`.
 const MSE_WORKER_SRC = `
 "use strict";
-// Chrome/Edge/Firefox only open a MediaSource constructed HERE (off the main thread); the page attaches the
-// transferable handle via video.srcObject. Protocol mirrors mse.ts:
+// The MediaSource is constructed HERE (off the main thread); the page attaches the transferable handle via
+// video.srcObject. Only reached when MediaSource.canConstructInDedicatedWorker is true. Protocol mirrors mse.ts:
 //   main -> worker: { cmd:"duration"|"addsb"|"append"|"eos", id, ... }
 //   worker -> main: { ev:"handle", handle } (transferred), { ev:"open" }, { ev:"reply", id, ok, ... }
 var ms = new MediaSource();
@@ -309,7 +319,8 @@ onmessage = function (e) {
 /**
  * Worker sink: spins up a dedicated Worker, constructs the MediaSource inside it, transfers the
  * MediaSourceHandle to the page for `video.srcObject`, and proxies every SourceBuffer touch over a tiny
- * id-correlated RPC. This is the ONLY attach that opens on Chrome/Edge/Firefox (issue #4). Segment bytes are
+ * id-correlated RPC. Selected only where {@link workerMseSupported} holds, and wrapped by
+ * {@link WorkerFirstMseSink} so an attach failure degrades to the main thread. Segment bytes are
  * structured-cloned (not transferred) — correctness over a negligible per-segment copy.
  */
 class WorkerMseSink implements MseSink {
@@ -319,11 +330,35 @@ class WorkerMseSink implements MseSink {
   private nextId = 1;
   private pending = new Map<number, { res: (v: Record<string, unknown>) => void; rej: (e: unknown) => void }>();
   private onOpen?: () => void;
+  /** The worker script's object URL, held only until it can be revoked. An object URL lives for the document's
+   *  lifetime unless revoked, so a player that mounts and unmounts through a scroll feed would otherwise strand
+   *  one blob per playback. Revoked as soon as attach settles (the worker has its source by then) and again in
+   *  close(), so no path — success, failure, or abort — leaves one behind. */
+  private blobUrl?: string;
+
+  private revokeBlob(): void {
+    const u = this.blobUrl;
+    this.blobUrl = undefined;
+    if (u === undefined) return;
+    try {
+      URL.revokeObjectURL(u);
+    } catch {
+      /* best-effort */
+    }
+  }
 
   async attach(video: HTMLVideoElement, signal: AbortSignal, timeoutMs: number): Promise<void> {
     this.signal = signal;
     if (signal.aborted) throw abortError();
-    const worker = new Worker(URL.createObjectURL(new Blob([MSE_WORKER_SRC], { type: "text/javascript" })));
+    const src = URL.createObjectURL(new Blob([MSE_WORKER_SRC], { type: "text/javascript" }));
+    this.blobUrl = src;
+    let worker: Worker;
+    try {
+      worker = new Worker(src);
+    } catch (e) {
+      this.revokeBlob(); // e.g. a host CSP that forbids blob: workers — don't leak the URL on the way out
+      throw e;
+    }
     this.worker = worker;
 
     // One handler for the worker's lifetime: attach the handle, resolve attach on "open", route RPC replies.
@@ -364,6 +399,7 @@ class WorkerMseSink implements MseSink {
         signal.removeEventListener("abort", onAbort);
         this.onOpen = undefined;
         worker.onerror = null;
+        this.revokeBlob(); // the worker has its source; the URL is dead weight from here on
         fn();
       };
       const onAbort = () => finish(() => reject(abortError()));
@@ -428,6 +464,7 @@ class WorkerMseSink implements MseSink {
   }
 
   close(): void {
+    this.revokeBlob(); // backstop: a close() before attach settled still frees the URL
     try {
       this.worker?.terminate();
     } catch {
@@ -446,14 +483,81 @@ class WorkerMseSink implements MseSink {
 }
 
 /**
- * Pick the sink for the current browser. WorkerMseSink for the browsers whose main-thread attach hangs
- * (Chrome/Edge/Firefox — they have `Worker` and no `ManagedMediaSource`); MainThreadMseSink where
- * `ManagedMediaSource` exists (Safari — the main-thread path works AND gives battery-managed buffering) or
- * where `Worker` is unavailable.
+ * Whether this browser can construct a MediaSource inside a dedicated Worker.
+ *
+ * `MediaSource.canConstructInDedicatedWorker` is the standard probe (Chrome 108+, Safari 17.1+). It matters
+ * because "has Worker" is NOT the same question: Firefox has Workers but has never shipped MSE-in-Workers, so
+ * the worker body's top-level `new MediaSource()` throws ReferenceError and every attach fails. Routing on the
+ * presence of `Worker` alone would take a browser whose main-thread attach works today and give it a player
+ * that cannot start at all — so the probe gates the worker path, and anything that fails it keeps the
+ * main-thread sink.
+ */
+export function workerMseSupported(): boolean {
+  if (typeof Worker === "undefined") return false;
+  const MS = (globalThis as unknown as { MediaSource?: { canConstructInDedicatedWorker?: boolean } }).MediaSource;
+  return MS?.canConstructInDedicatedWorker === true;
+}
+
+/**
+ * The worker sink with a main-thread fallback. Feature detection covers the browsers we know can't host a
+ * MediaSource in a worker; this covers the ones that claim they can and then don't — a host CSP that forbids
+ * `blob:` workers, a worker that starts but never posts `open`, an element that rejects the handle. The
+ * main-thread path is what shipped before the worker sink and still works everywhere except the attach quirk
+ * the worker sink exists for, so a failed worker attach must degrade to it rather than end playback.
+ *
+ * Delegates everything else — the fallback is only a decision about which sink ends up behind the seam.
+ */
+class WorkerFirstMseSink implements MseSink {
+  attachMethod = "worker-handle";
+  private inner: MseSink = new WorkerMseSink();
+
+  async attach(video: HTMLVideoElement, signal: AbortSignal, timeoutMs: number): Promise<void> {
+    try {
+      await this.inner.attach(video, signal, timeoutMs);
+    } catch (e) {
+      if (isAbort(e)) throw e; // a caller teardown is not a browser problem — never retry it
+      try {
+        this.inner.close(); // terminate the half-started worker before replacing it
+      } catch {
+        /* best-effort */
+      }
+      try {
+        (video as unknown as { srcObject: unknown }).srcObject = null; // drop a half-attached handle
+      } catch {
+        /* not srcObject */
+      }
+      this.inner = new MainThreadMseSink();
+      await this.inner.attach(video, signal, timeoutMs);
+    }
+    this.attachMethod = this.inner.attachMethod;
+  }
+
+  setDuration(sec: number | undefined): Promise<number> {
+    return this.inner.setDuration(sec);
+  }
+  addSourceBuffer(mime: string): Promise<boolean> {
+    return this.inner.addSourceBuffer(mime);
+  }
+  append(buf: Uint8Array): Promise<void> {
+    return this.inner.append(buf);
+  }
+  endOfStream(): void {
+    this.inner.endOfStream();
+  }
+  close(): void {
+    this.inner.close();
+  }
+}
+
+/**
+ * Pick the sink for the current browser. The worker sink (with its main-thread fallback) for browsers that can
+ * construct a MediaSource in a Worker and have no `ManagedMediaSource`; MainThreadMseSink where
+ * `ManagedMediaSource` exists (Safari — the main-thread path works AND gives battery-managed buffering), where
+ * `Worker` is unavailable, or where MSE-in-Workers isn't supported (Firefox today).
  */
 export function createMseSink(): MseSink {
   const hasManagedMediaSource =
     typeof (globalThis as unknown as { ManagedMediaSource?: unknown }).ManagedMediaSource !== "undefined";
-  if (typeof Worker !== "undefined" && !hasManagedMediaSource) return new WorkerMseSink();
+  if (!hasManagedMediaSource && workerMseSupported()) return new WorkerFirstMseSink();
   return new MainThreadMseSink();
 }

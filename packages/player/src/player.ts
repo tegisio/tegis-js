@@ -1055,7 +1055,12 @@ export class TegisPlayer {
       }
       this.beacon("error", e instanceof Error ? e.message.slice(0, 80) : "play_failed");
       onError({ code: "play_failed", message: e instanceof Error ? e.message : "play failed", cause: e });
-      this.emitQoe();
+      // A failed play() tears everything down too, not just an aborted one. By this point the sink may own a
+      // live dedicated Worker holding an open MediaSource attached to the element — and the caller has no
+      // handle.stop() to clean up with, because play() is throwing instead of returning one. Without this, a
+      // host that retries after `codec_unsupported` or `attach_failed` strands one worker per attempt for the
+      // page's lifetime. teardown() is idempotent and flushes the terminal QoE beacon itself.
+      await teardown();
       throw e;
     }
   }
