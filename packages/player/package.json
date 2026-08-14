@@ -30,6 +30,12 @@
       "import": "./dist/index.js",
       "default": "./dist/index.js"
     },
+    "./ui": {
+      "types": "./dist/ui.d.ts",
+      "browser": "./dist/ui.js",
+      "import": "./dist/ui.js",
+      "default": "./dist/ui.js"
+    },
     "./bundle": {
       "types": "./dist/bundle-entry.d.ts",
       "default": "./dist/bundle-entry.js"
@@ -49,7 +55,8 @@
     "LICENSE"
   ],
   "sideEffects": [
-    "./src/bundle-entry.ts"
+    "./dist/bundle-entry.js",
+    "./dist/ui.js"
   ],
   "publishConfig": {
     "access": "public"
@@ -57,7 +64,7 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "clean": "rm -rf dist",
-    "build": "bun run clean && bun build ./src/index.ts ./src/bundle-entry.ts --target=browser --format=esm --outdir dist && tsc -p tsconfig.build.json && bun ../../scripts/fix-dts.ts dist",
+    "build": "bun run clean && bun build ./src/index.ts ./src/bundle-entry.ts ./src/ui.ts --target=browser --format=esm --outdir dist && tsc -p tsconfig.build.json && bun ../../scripts/fix-dts.ts dist",
     "prepublishOnly": "bun run build"
   }
 }
