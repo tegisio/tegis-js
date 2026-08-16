@@ -13,6 +13,19 @@ export type {
   PlaybackHandle,
   PlayError,
 } from "./player.ts";
+// VOD delivery path (lean-vod-redesign): shaka-player + clear-key CENC. The pure helpers are exported so a
+// host (or the test harness) can drive the grant→config transform directly.
+export {
+  extractVod,
+  keyB64uToHex,
+  keyHexFromResponse,
+  parseKeyResponse,
+  clearKeysConfig,
+  normalizeKid,
+  bytesToHex,
+  seekTargetFor,
+} from "./vod.ts";
+export type { VodDelivery, KeyResponse, ClearKeysConfig, ShakaLike, ShakaPlayerLike } from "./vod.ts";
 export { loadWasmHandshake, loadWhitenedHandshake } from "./handshake-wasm.ts";
 export type { HandshakeFn } from "./handshake-wasm.ts";
 

@@ -64,7 +64,10 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "clean": "rm -rf dist",
-    "build": "bun run clean && bun build ./src/index.ts ./src/bundle-entry.ts ./src/ui.ts --target=browser --format=esm --outdir dist && tsc -p tsconfig.build.json && bun ../../scripts/fix-dts.ts dist",
+    "build": "bun run clean && bun build ./src/index.ts ./src/bundle-entry.ts ./src/ui.ts --target=browser --format=esm --splitting --outdir dist && tsc -p tsconfig.build.json && bun ../../scripts/fix-dts.ts dist",
     "prepublishOnly": "bun run build"
+  },
+  "dependencies": {
+    "shaka-player": "4.16.44"
   }
 }

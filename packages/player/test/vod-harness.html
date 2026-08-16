@@ -1,0 +1,241 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>@tegis/player — VOD playback harness</title>
+    <style>
+      :root { color-scheme: light dark; }
+      body { margin: 0; font: 14px/1.5 system-ui, sans-serif; background: #0b0b0c; color: #e7e7ea; }
+      header { padding: 12px 16px; border-bottom: 1px solid #23232a; }
+      h1 { font-size: 15px; margin: 0; font-weight: 600; }
+      .sub { color: #8a8a94; font-size: 12px; margin-top: 2px; }
+      main { display: grid; grid-template-columns: minmax(0, 1fr) 360px; gap: 16px; padding: 16px; }
+      @media (max-width: 800px) { main { grid-template-columns: 1fr; } }
+      video { width: 100%; background: #000; border-radius: 8px; aspect-ratio: 16 / 9; }
+      pre { margin: 0; padding: 12px; background: #131318; border: 1px solid #23232a; border-radius: 8px;
+        white-space: pre-wrap; word-break: break-word; font: 12px/1.5 ui-monospace, monospace; }
+      .k { color: #8a8a94; }
+      .ok { color: #4ade80; } .bad { color: #f87171; } .warn { color: #fbbf24; }
+      label { display: block; font-size: 12px; color: #8a8a94; margin: 8px 0 2px; }
+      input { width: 100%; box-sizing: border-box; padding: 6px 8px; background: #131318; color: #e7e7ea;
+        border: 1px solid #23232a; border-radius: 6px; font: 12px ui-monospace, monospace; }
+      button { margin-top: 10px; padding: 8px 14px; background: #2563eb; color: #fff; border: 0;
+        border-radius: 6px; font-weight: 600; cursor: pointer; }
+      details { margin-top: 12px; } summary { cursor: pointer; color: #8a8a94; }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>@tegis/player — VOD playback harness</h1>
+      <div class="sub">
+        Pre-packaged CENC fMP4 HLS + shaka-player clear-key. Full-seek verification. State on
+        <code>window.__vod</code>.
+      </div>
+    </header>
+    <main>
+      <div>
+        <video id="v" playsinline muted controls></video>
+        <details open>
+          <summary>Inputs (URL query params <code>?manifestUrl=&amp;keyUrl=&amp;kid=</code>, or set
+            <code>window.__vodConfig</code> before load)</summary>
+          <label for="manifestUrl">manifestUrl (HLS master.m3u8)</label>
+          <input id="manifestUrl" placeholder="https://edge/vod/v1/{ast}/master.m3u8" />
+          <label for="keyUrl">keyUrl (gated → {alg,key})</label>
+          <input id="keyUrl" placeholder="https://mint/key/v1/{ast}?sig=..." />
+          <label for="kid">kid (32 hex chars)</label>
+          <input id="kid" placeholder="0f0e0d0c0b0a09080706050403020100" />
+          <label for="seekTarget">seek target seconds (default 240, clamped to duration/2)</label>
+          <input id="seekTarget" placeholder="240" />
+          <button id="run">Run VOD flow</button>
+        </details>
+      </div>
+      <pre id="out">idle</pre>
+    </main>
+
+    <script>
+      // ── VOD playback state, polled by the e2e ─────────────────────────────────────────────────────────
+      // This mirrors the SDK's TegisPlayer.playVod flow, but takes manifestUrl/keyUrl/kid DIRECTLY so an e2e
+      // can drive it with real values without standing up a live mint. The SDK's pure transforms
+      // (base64url→hex key, clearKeys config, seek-target clamp) are re-implemented inline here so the page is
+      // self-contained and runnable with no build step; packages/player/test/vod.test.ts unit-tests the
+      // canonical SDK versions of the same logic.
+      const SHAKA_DEFAULT = "https://cdn.jsdelivr.net/npm/shaka-player@4.16.44/dist/shaka-player.compiled.js";
+
+      window.__vod = {
+        stage: "init",
+        loaded: false,
+        duration: NaN,
+        seekableEnd: NaN,
+        error: null,
+        mediaError: null,
+        afterSeekTime: NaN,
+        playedPast: false,
+        seekTarget: NaN,
+        autoplay: null,
+      };
+
+      const out = document.getElementById("out");
+      function render() {
+        const s = window.__vod;
+        const line = (k, v, cls) => `<span class="k">${k}</span> ${cls ? `<span class="${cls}">${v}</span>` : v}`;
+        out.innerHTML = [
+          line("stage", s.stage, s.error ? "bad" : s.stage === "done" ? "ok" : "warn"),
+          line("loaded", s.loaded, s.loaded ? "ok" : ""),
+          line("duration", Number.isFinite(s.duration) ? s.duration.toFixed(2) + "s" : "—"),
+          line("seekableEnd", Number.isFinite(s.seekableEnd) ? s.seekableEnd.toFixed(2) + "s" : "—"),
+          line("seekTarget", Number.isFinite(s.seekTarget) ? s.seekTarget.toFixed(2) + "s" : "—"),
+          line("afterSeekTime", Number.isFinite(s.afterSeekTime) ? s.afterSeekTime.toFixed(2) + "s" : "—"),
+          line("playedPast", s.playedPast, s.playedPast ? "ok" : ""),
+          line("autoplay", s.autoplay ?? "—"),
+          line("mediaError", s.mediaError ?? "—", s.mediaError ? "bad" : ""),
+          line("error", s.error ?? "—", s.error ? "bad" : ""),
+        ].join("\n");
+      }
+      function set(patch) {
+        Object.assign(window.__vod, patch);
+        render();
+      }
+
+      // base64url → 32-char hex (the gated keyUrl returns { alg, key: <base64url 16 bytes> }).
+      function keyB64uToHex(b64u) {
+        let s = String(b64u).replace(/-/g, "+").replace(/_/g, "/");
+        while (s.length % 4) s += "=";
+        const bin = atob(s);
+        if (bin.length !== 16) throw new Error("key must decode to 16 bytes (AES-128), got " + bin.length);
+        let hex = "";
+        for (let i = 0; i < bin.length; i++) hex += bin.charCodeAt(i).toString(16).padStart(2, "0");
+        return hex;
+      }
+      function normalizeKid(kid) {
+        const h = String(kid || "").trim().replace(/-/g, "").toLowerCase();
+        if (!/^[0-9a-f]{32}$/.test(h)) throw new Error("kid must be 32 hex chars (16 bytes), got " + JSON.stringify(kid));
+        return h;
+      }
+      // default 240s, clamped to duration/2 when the asset is shorter than 2× the target
+      function seekTargetFor(durationSec, want) {
+        want = Number.isFinite(want) && want > 0 ? want : 240;
+        if (!Number.isFinite(durationSec) || durationSec <= 0) return want;
+        return Math.min(want, durationSec / 2);
+      }
+
+      function loadShaka(url) {
+        return new Promise((resolve, reject) => {
+          if (window.shaka && window.shaka.Player) return resolve(window.shaka);
+          const el = document.createElement("script");
+          el.src = url;
+          el.onload = () => (window.shaka && window.shaka.Player ? resolve(window.shaka) : reject(new Error("shaka loaded but no Player")));
+          el.onerror = () => reject(new Error("failed to load shaka-player from " + url));
+          document.head.appendChild(el);
+        });
+      }
+
+      function readConfig() {
+        const q = new URLSearchParams(location.search);
+        const cfg = window.__vodConfig || {};
+        const pick = (k) => cfg[k] ?? q.get(k) ?? document.getElementById(k)?.value ?? "";
+        return {
+          manifestUrl: String(pick("manifestUrl")).trim(),
+          keyUrl: String(pick("keyUrl")).trim(),
+          kid: String(pick("kid")).trim(),
+          seekTarget: Number(pick("seekTarget")) || 240,
+          shakaUrl: String(cfg.shaka ?? q.get("shaka") ?? SHAKA_DEFAULT).trim(),
+          autorun: cfg.autorun ?? (q.get("autorun") !== "0"),
+        };
+      }
+
+      async function runVodFlow() {
+        const cfg = readConfig();
+        // reflect into the inputs so a human can see what's driving it
+        for (const k of ["manifestUrl", "keyUrl", "kid"]) if (document.getElementById(k) && cfg[k]) document.getElementById(k).value = cfg[k];
+
+        const video = document.getElementById("v");
+        video.muted = true; // muted so autoplay is allowed
+        video.playsInline = true;
+
+        video.addEventListener("error", () => {
+          const e = video.error;
+          set({ mediaError: e ? "MediaError " + e.code + (e.message ? ": " + e.message : "") : "unknown media error" });
+        });
+
+        try {
+          if (!cfg.manifestUrl || !cfg.keyUrl || !cfg.kid) throw new Error("manifestUrl, keyUrl and kid are all required");
+          const kid = normalizeKid(cfg.kid);
+
+          set({ stage: "loading-shaka" });
+          const shaka = await loadShaka(cfg.shakaUrl);
+          if (shaka.polyfill && shaka.polyfill.installAll) shaka.polyfill.installAll();
+          if (shaka.Player.isBrowserSupported && !shaka.Player.isBrowserSupported()) throw new Error("shaka: browser unsupported");
+
+          set({ stage: "fetching-key" });
+          const keyRes = await fetch(cfg.keyUrl);
+          if (!keyRes.ok) throw new Error("key fetch failed: " + keyRes.status);
+          const keyJson = await keyRes.json();
+          const keyHex = keyB64uToHex(keyJson.key);
+
+          set({ stage: "configuring" });
+          const player = new shaka.Player();
+          window.__player = player;
+          await player.attach(video);
+          player.configure({ drm: { clearKeys: { [kid]: keyHex } } });
+          player.addEventListener("error", (ev) => {
+            const d = (ev && ev.detail) || {};
+            set({ error: "shaka error " + (d.code ?? "?") + (d.message ? ": " + d.message : "") });
+          });
+
+          set({ stage: "loading-manifest" });
+          await player.load(cfg.manifestUrl);
+
+          const duration = video.duration;
+          let seekableEnd = duration;
+          try { const r = player.seekRange(); if (r && Number.isFinite(r.end)) seekableEnd = r.end; } catch {}
+          const target = seekTargetFor(duration, cfg.seekTarget);
+          set({ stage: "loaded", loaded: true, duration, seekableEnd, seekTarget: target });
+
+          // best-effort muted autoplay
+          try {
+            await video.play();
+            set({ autoplay: video.muted ? "muted" : "playing" });
+          } catch (e) {
+            set({ autoplay: "blocked" });
+          }
+
+          // seek into the asset and verify playback advances past the target — the thing the JIT player
+          // structurally could not do.
+          set({ stage: "seeking" });
+          video.currentTime = target;
+          try { await video.play(); } catch {}
+
+          await new Promise((resolve) => {
+            const EPS = 0.15;
+            let done = false;
+            const finish = (advanced) => {
+              if (done) return;
+              done = true;
+              video.removeEventListener("timeupdate", onTick);
+              set({ stage: advanced ? "done" : "seek-timeout", playedPast: advanced, afterSeekTime: video.currentTime });
+              resolve();
+            };
+            const onTick = () => {
+              if (video.currentTime > target + EPS) finish(true);
+            };
+            video.addEventListener("timeupdate", onTick);
+            // safety cap: finalize after 25s regardless, recording whatever we observed
+            setTimeout(() => finish(video.currentTime > target + EPS), 25000);
+          });
+        } catch (e) {
+          set({ stage: "error", error: e && e.message ? e.message : String(e) });
+        }
+      }
+
+      document.getElementById("run").addEventListener("click", () => runVodFlow());
+      render();
+      // Auto-run when driven by query params / __vodConfig (an e2e sets these); skippable with ?autorun=0.
+      const initial = readConfig();
+      if (initial.autorun && (initial.manifestUrl || (window.__vodConfig && window.__vodConfig.manifestUrl))) {
+        window.addEventListener("DOMContentLoaded", () => runVodFlow());
+        if (document.readyState !== "loading") runVodFlow();
+      }
+    </script>
+  </body>
+</html>

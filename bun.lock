@@ -11,11 +11,14 @@
     },
     "packages/player": {
       "name": "@tegis/player",
-      "version": "0.1.2",
+      "version": "0.2.6",
+      "dependencies": {
+        "shaka-player": "4.16.44",
+      },
     },
     "packages/server": {
       "name": "@tegis/server",
-      "version": "0.1.2",
+      "version": "0.1.3",
     },
   },
   "packages": {
@@ -24,6 +27,8 @@
     "@tegis/server": ["@tegis/server@workspace:packages/server"],
 
     "@types/node": ["@types/node@22.20.0", "", { "dependencies": { "undici-types": "~6.21.0" } }, "sha512-QWlFW2wf3nTjC13/DqRnBpR4ZO36VJH/JVBkA/vcnmbTBNQIlnObqyqZE1tUR7+Ni23Lda8R1BxMfbXRpCUx5g=="],
+
+    "shaka-player": ["shaka-player@4.16.44", "", {}, "sha512-t/eCE8IyrUes3xwdEL8U078PsRNEI+DhICcu5n7Laj5ycRe0QD3kDTWCaElTZxFQvA5dzjN8lKerNSyfWGPqVA=="],
 
     "typescript": ["typescript@6.0.3", "", { "bin": { "tsc": "bin/tsc", "tsserver": "bin/tsserver" } }, "sha512-y2TvuxSZPDyQakkFRPZHKFm+KKVqIisdg9/CZwm9ftvKXLP8NRWj38/ODjNbr43SsoXqNuAisEf1GdCxqWcdBw=="],
 

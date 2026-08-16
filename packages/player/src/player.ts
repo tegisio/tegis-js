@@ -7,6 +7,21 @@
 import { handshake as wcHandshake, hbSign, decryptSegment, unb64u } from "./crypto.ts";
 import { QoeCollector } from "./qoe.ts";
 import { createMseSink, type MseSink } from "./mse.ts";
+import { extractVod, keyHexFromResponse, clearKeysConfig, type VodDelivery, type ShakaLike, type ShakaPlayerLike } from "./vod.ts";
+
+// The VOD delivery path (lean-vod-redesign) lives in ./vod.ts. Re-exported here because it is part of this
+// module's public surface — the SDK entry (index.ts) and the browser bundle expose it.
+export {
+  extractVod,
+  keyB64uToHex,
+  keyHexFromResponse,
+  parseKeyResponse,
+  clearKeysConfig,
+  normalizeKid,
+  bytesToHex,
+  seekTargetFor,
+} from "./vod.ts";
+export type { VodDelivery, KeyResponse, ClearKeysConfig, ShakaLike, ShakaPlayerLike } from "./vod.ts";
 
 // The MSE MediaSource/SourceBuffer helpers live in ./mse.ts now (they back MainThreadMseSink). Re-exported
 // here because they are part of this module's public surface (imported by the test suite from player.ts).
@@ -38,6 +53,10 @@ export interface BrowserPlayerConfig {
   /** Injectable monotonic clock (ms) for QoE timing — TTFF (play-requested → first frame). Defaults to
    *  `performance.now()`. Lets tests measure durations deterministically. */
   now?: () => number;
+  /** VOD path (lean-vod-redesign): an injectable shaka-player namespace. When omitted, {@link TegisPlayer.playVod}
+   *  lazy-imports the bundled shaka-player on first use (kept out of the main bundle via a dynamic import). Set
+   *  this to reuse a shaka already loaded on the page (e.g. via a `<script>`/CDN tag) or to inject a stub in tests. */
+  shaka?: ShakaLike;
 }
 
 /** Retry budget for JIT `preparing` tolerance (spec 12 §4.6). Defaults: maxAttempts 6, baseDelayMs 500,
@@ -114,6 +133,10 @@ export interface Grant {
    *  back to muted because autoplay-with-audio was blocked), or `blocked` (needs a user gesture). Lets a
    *  caller surface an unmute hint / play button instead of being left on a frozen frame. */
   autoplay?: "playing" | "muted" | "blocked";
+  /** VOD delivery contract (lean-vod-redesign): present when the asset is pre-packaged to CENC-encrypted
+   *  fMP4 HLS. {@link TegisPlayer.playVod} plays it with shaka-player under a clear-key CENC license — full
+   *  seek across the whole asset. Absent on the legacy JIT path (which {@link TegisPlayer.play} still serves). */
+  vod?: VodDelivery;
 }
 
 function randHex(n: number): string {
@@ -558,6 +581,195 @@ export class TegisPlayer {
     if (r.status !== 200) throw new Error("key fetch failed: " + r.status);
     return unb64u((await r.json()).key);
   }
+
+  // ── VOD path (lean-vod-redesign) ────────────────────────────────────────────────────────────────────
+  // For pre-packaged content the whole asset is CENC-encrypted fMP4 HLS in R2, served static + CDN-cached
+  // through the entitlement-gated edge, and played by shaka-player under a clear-key CENC license. This gives
+  // full seek over the entire asset — the thing the JIT segment-feed structurally could not do. The
+  // entitlement funnel (attest → handshake → mint), QoE, and client beacons are preserved exactly; only the
+  // media engine changes from the hand-rolled MSE feed to shaka.
+
+  /**
+   * Resolve the shaka-player namespace: an injected `cfg.shaka`, else a shaka already on the page
+   * (`globalThis.shaka`), else a lazy dynamic `import("shaka-player")` — kept dynamic so shaka (≈1.3 MB) is
+   * a separate chunk that only loads when {@link playVod} actually runs, never at SDK import time.
+   */
+  private async loadShaka(): Promise<ShakaLike> {
+    if (this.cfg.shaka?.Player) return this.cfg.shaka;
+    const g = globalThis as unknown as { shaka?: ShakaLike };
+    if (g.shaka?.Player) return g.shaka;
+    const mod = (await import("shaka-player")) as unknown as { default?: ShakaLike } & Partial<ShakaLike>;
+    const s = (mod.default ?? (mod as unknown as ShakaLike)) as ShakaLike;
+    if (!s?.Player) throw new Error("playVod: failed to load shaka-player (no Player export)");
+    return s;
+  }
+
+  /**
+   * Fetch the CENC content key from the grant's gated `vod.keyUrl` and return it as the 32-char hex string
+   * shaka clearKeys wants. The keyUrl is self-authenticating (mint-signed) so it's fetched WITHOUT auth
+   * headers — a preflight-free cross-origin GET, exactly like the signed segment/key URLs on the JIT path.
+   */
+  async vodKeyHex(keyUrl: string, signal?: AbortSignal): Promise<string> {
+    const url = keyUrl.startsWith("http") ? keyUrl : this.cfg.mint + keyUrl;
+    const r = await this.f(url, { signal });
+    if (r.status !== 200) throw new Error("vod key fetch failed: " + r.status);
+    return keyHexFromResponse(await r.json());
+  }
+
+  /**
+   * Play a pre-packaged VOD asset with shaka-player (full seek, ABR, clear-key CENC).
+   *
+   * Flow: run the entitlement funnel via {@link mint} → read `grant.vod` ({@link extractVod}) → fetch the
+   * gated key ({@link vodKeyHex}) → configure shaka with `{ drm: { clearKeys: { [kid]: keyHex } } }`
+   * ({@link clearKeysConfig}) → `player.load(manifestUrl)`. The same QoE/funnel wiring the JIT `play()` uses
+   * is attached to the `<video>` here (it's delivery-agnostic — it listens to media events shaka also drives),
+   * so TTFF / rebuffer / watch-through telemetry keeps flowing. Returns a {@link PlaybackHandle} whose
+   * `stop()` destroys the shaka player and tears the element down.
+   */
+  async playVod(video: HTMLVideoElement, opts: PlayOpts): Promise<PlaybackHandle> {
+    if (!video) throw new Error("playVod: a video element is required");
+
+    const ac = new AbortController();
+    const signal = ac.signal;
+    let stopped = false;
+    let shakaPlayer: ShakaPlayerLike | undefined;
+
+    const onError = (e: PlayError): void => {
+      try {
+        console.error(`[tegis/player] ${e.code}: ${e.message}`, e.cause ?? "");
+      } catch {
+        /* console may be absent */
+      }
+      this.beacon("error", e.code);
+      try {
+        opts.onError?.(e);
+      } catch {
+        /* a host callback must never break playback */
+      }
+    };
+    const teardown = async (): Promise<void> => {
+      if (stopped) return;
+      stopped = true;
+      ac.abort();
+      try {
+        video.pause();
+      } catch {
+        /* detached/gone */
+      }
+      try {
+        await shakaPlayer?.destroy(); // detaches from the element + frees MSE/EME
+      } catch {
+        /* best-effort */
+      }
+      this.emitQoe();
+    };
+    if (opts.signal) {
+      if (opts.signal.aborted) ac.abort();
+      else opts.signal.addEventListener("abort", () => void teardown(), { once: true });
+    }
+
+    // Client funnel + element setup — identical bookkeeping to play() so telemetry is uniform across paths.
+    const ses = this.attSes ?? opts.ses ?? "ses_" + randHex(4);
+    this.evtSes = ses;
+    this.evtAst = opts.assetId;
+    this.evtPbk = undefined;
+    this.watched.clear();
+    this.assetDurationSec = 0;
+    this.qoe.reset();
+    this.qoeSent = false;
+    if (opts.loop) video.loop = true;
+    if (opts.muted) video.muted = true;
+    if (opts.playsInline !== false) {
+      video.playsInline = true;
+      try {
+        video.setAttribute("playsinline", "");
+      } catch {
+        /* non-DOM stub */
+      }
+    }
+    if (opts.onFirstFrame) {
+      video.addEventListener(
+        "playing",
+        () => {
+          try {
+            opts.onFirstFrame!();
+          } catch {
+            /* a host callback must never break playback */
+          }
+        },
+        { once: true },
+      );
+    }
+    this.wireFunnel(video);
+    this.wireUnloadQoe();
+    this.qoe.markPlayRequested();
+    this.beacon("play_requested");
+
+    try {
+      throwIfAborted(signal);
+      const g = await this.mint({ ...opts, ses }, signal);
+      this.evtSes = this.attSes ?? ses;
+      this.evtPbk = g.playbackId;
+      this.beacon("granted");
+
+      // Delivery contract + gated key. extractVod throws legibly if this asset isn't VOD-enabled.
+      const vod = extractVod(g);
+      const keyHex = await this.vodKeyHex(vod.keyUrl, signal);
+      throwIfAborted(signal);
+
+      const shaka = await this.loadShaka();
+      if (typeof shaka.Player.isBrowserSupported === "function" && !shaka.Player.isBrowserSupported()) {
+        const e: PlayError = { code: "codec_unsupported", message: "shaka-player: browser unsupported for MSE/EME playback" };
+        onError(e);
+        throw new Error(e.message);
+      }
+      const player = new shaka.Player();
+      shakaPlayer = player;
+      await player.attach(video);
+      // The whole DRM config: clear-key CENC keyed by the grant's kid. shaka decrypts every segment natively.
+      player.configure(clearKeysConfig(vod.kid, keyHex));
+      player.addEventListener("error", (ev) => {
+        const detail = (ev?.detail ?? {}) as { code?: unknown; message?: unknown };
+        onError({
+          code: "decode",
+          message: `shaka error ${detail.code ?? "?"}${detail.message ? ": " + detail.message : ""}`,
+          cause: detail,
+        });
+      });
+
+      throwIfAborted(signal);
+      await player.load(vod.manifestUrl); // full manifest → full seek over the entire asset
+
+      // Asset length for watch-through quartiles: shaka reports the true duration once loaded; fall back to
+      // the grant's declared length. (Unlike the MSE path, video.duration under shaka IS the asset length.)
+      const loaded = Number.isFinite(video.duration) && video.duration > 0 ? video.duration : (g.duration ?? 0);
+      this.assetDurationSec = loaded > 0 ? loaded : 0;
+
+      // Best-effort autoplay (muted fallback when autoplay-with-audio is blocked), mirroring the JIT path.
+      try {
+        const p = video.play();
+        if (p && typeof (p as Promise<void>).then === "function") await p;
+        g.autoplay = video.muted ? "muted" : "playing";
+      } catch {
+        try {
+          video.muted = true;
+          await video.play();
+          g.autoplay = "muted";
+        } catch {
+          g.autoplay = "blocked";
+        }
+      }
+
+      return Object.assign({}, g, { stop: teardown }) as PlaybackHandle;
+    } catch (e) {
+      if (!isAbort(e)) {
+        onError({ code: "play_failed", message: e instanceof Error ? e.message : String(e), cause: e });
+      }
+      await teardown();
+      throw e;
+    }
+  }
+
   private jitOpts(): Required<JitConfig> {
     return { maxAttempts: 6, baseDelayMs: 500, maxDelayMs: 8000, ...(this.cfg.jit ?? {}) };
   }
