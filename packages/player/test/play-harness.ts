@@ -4,7 +4,7 @@
 //
 // Not a `.test.ts` file on purpose: `bun test` collects only `*.test.ts`, so this is shared setup, not a suite.
 
-import { TegisPlayer, type Grant } from "../src/player.ts";
+import { TegisPlayer, type Grant, type ShakaLike } from "../src/player.ts";
 import { b64u } from "../src/crypto.ts";
 
 // ---- fake <video> --------------------------------------------------------------------------------------
@@ -254,6 +254,7 @@ export interface Harness {
 export function harness(
   script: MintScript = {},
   videoInit: { currentTime?: number; ranges?: Array<[number, number]>; telemetry?: boolean } = {},
+  extra: { shaka?: ShakaLike; failVodKey?: boolean } = {},
 ): Harness {
   const renewHbs: Harness["renewHbs"] = [];
   const seekHbs: Harness["seekHbs"] = [];
@@ -297,6 +298,12 @@ export function harness(
       return Response.json(r);
     }
     if (url.endsWith("/mint/v1")) return Response.json(grant);
+    // The VOD gated key endpoint (grant.vod.keyUrl). Distinct path from the JIT `/key/v1/` so a test can fail
+    // JUST the vod key (driving play()'s fallback) while the JIT content key still resolves.
+    if (url.includes("/vodkey/")) {
+      if (extra.failVodKey) return new Response(null, { status: 404 });
+      return Response.json({ alg: "AES-128", key: b64u(CONTENT_KEY) });
+    }
     if (url.includes("/key/v1/")) return Response.json({ key: b64u(CONTENT_KEY) });
     if (url.endsWith("/init.mp4")) return new Response(new Uint8Array(32), { status: 200 }); // unparseable → DEFAULT_MIME
     segmentFetches.push(url);
@@ -311,6 +318,7 @@ export function harness(
     handshakeFn: async () => "hs",
     fetchImpl,
     telemetry: videoInit.telemetry === true, // off by default: most tests don't want the beacon traffic
+    shaka: extra.shaka, // injected shaka stub for the VOD auto-dispatch path (undefined ⇒ JIT-only tests)
   });
   return {
     player,
